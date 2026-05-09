@@ -1,0 +1,13 @@
+name,bus,p_nom,p_max_pu,carrier,marginal_cost,build_year
+ARG_hydro,ARG,12.0,0.75,hydro,3.5,1983
+AVI_hydro,AVI,220.0,0.75,hydro,3.5,1968
+BEN_hydro,BEN,540.0,0.75,hydro,3.5,1965
+BWK_hydro,BWK,74.0,0.0,hydro,3.5,1902
+CYD_hydro,CYD,432.0,0.75,hydro,3.5,1992
+MAN_hydro,MAN,802.0,0.75,hydro,3.5,1972
+OHA_hydro,OHA,264.0,0.75,hydro,3.5,1980
+OHB_hydro,OHB,212.0,0.75,hydro,3.5,1984
+OHC_hydro,OHC,212.0,0.75,hydro,3.5,1985
+ROX_110_hydro,ROX_110,123.0,0.75,hydro,3.5,1956
+ROX_220_hydro,ROX_220,205.0,0.75,hydro,3.5,1956
+TKB_hydro,TKB,160.0,0.75,hydro,3.5,1977

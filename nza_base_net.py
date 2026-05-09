@@ -100,6 +100,34 @@ AC_VOLT_THRESHOLD_KV = 110
 # s_nom is set extendable with capital_cost=0 as placeholder.
 TRANSFORMER_TYPE = "630MVA 220/110kV"
 
+# Custom transformer types not in the PyPSA standard library.
+# Parameters based on 100 MVA 220/110 kV type, scaled to 630 MVA.
+CUSTOM_TRANSFORMER_TYPES = {
+    "630MVA 220/110kV": {
+        "f_nom":        50.0,
+        "vn_hv":       220.0,
+        "vn_lv":       110.0,
+        "vsc":          12.0,
+        "vscr":          0.4,
+        "pfe":           0.0,
+        "i0":            0.0,
+        "s_nom":       630.0,
+        "tap_side":      0,
+        "tap_neutral":   0,
+        "tap_min":      -9,
+        "tap_max":       9,
+        "tap_step":      1.5,
+    }
+}
+
+
+def register_custom_transformer_types(network: pypsa.Network) -> None:
+    """Add custom transformer types to the network type library."""
+    for name, params in CUSTOM_TRANSFORMER_TYPES.items():
+        if name not in network.transformer_types.index:
+            network.transformer_types.loc[name] = params
+
+
 # Months list used for naming monthly network folders.
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
           "jul", "aug", "sep", "oct", "nov", "dec"]
@@ -167,6 +195,8 @@ def resolve_paths(config: Dict) -> Dict:
 
     return {
         "nodes":    root / config["paths"]["dirpath_manual"]  / config["filename"]["nodes"],
+        "lines_si": root / config["paths"]["dirpath_manual"]  / config["filename"].get("lines_si", "lines_data_si.csv"),
+        "lines_ni": root / config["paths"]["dirpath_manual"]  / config["filename"].get("lines_ni", "lines_data_ni.csv"),
         "lines":    root / config["paths"]["dirpath_manual"]  / config["filename"]["lines"],
         "links":    root / config["paths"]["dirpath_manual"]  / config["filename"]["links"],
         "gen_reg":  root / config["paths"]["dirpath_static"]  / config["filename"]["generator_registry"],
@@ -238,8 +268,52 @@ def load_lines(lines_path: Path) -> pd.DataFrame:
         if df[col].dtype == object:
             df[col] = df[col].str.strip()
 
-    df["volts"]    = pd.to_numeric(df["volts"],    errors="coerce")
-    df["distance"] = pd.to_numeric(df["distance"], errors="coerce")
+    df["volts"] = pd.to_numeric(df["volts"], errors="coerce")
+
+    # Determine circuit length column using fallback logic:
+    #   1. Use 'distance' if the column exists and is complete (no NaN)
+    #   2. Fall back to 'length' if 'distance' is absent or incomplete
+    #   3. Abort if 'length' is also absent or has NaN values
+    has_distance = "distance" in df.columns
+    has_length   = "length"   in df.columns
+
+    if has_distance:
+        df["_dist_raw"] = pd.to_numeric(df["distance"], errors="coerce")
+        n_dist_nan = df["_dist_raw"].isna().sum()
+    else:
+        n_dist_nan = len(df)
+
+    if has_length:
+        df["_len_raw"] = pd.to_numeric(df["length"], errors="coerce")
+        n_len_nan = df["_len_raw"].isna().sum()
+    else:
+        n_len_nan = len(df)
+
+    if has_distance and n_dist_nan == 0:
+        df["distance"] = df["_dist_raw"]
+        log.info("  Circuit length: using 'distance' column (QGIS-measured, complete)")
+    elif has_length and n_len_nan == 0:
+        df["distance"] = df["_len_raw"]
+        if has_distance and n_dist_nan > 0:
+            missing = df[df["_dist_raw"].isna()]["line"].tolist()
+            log.warning("  'distance' column incomplete (%d missing): %s",
+                        n_dist_nan, missing)
+        log.info("  Circuit length: using 'length' column (straight-line estimates)")
+        log.info("  NOTE: straight-line lengths are a lower bound on true circuit")
+        log.info("        length.  Impedances will be underestimated accordingly.")
+    else:
+        missing_len = df[df["_len_raw"].isna()]["line"].tolist() if has_length else "all"
+        raise ValueError(
+            f"No complete circuit length column found in lines_data.csv.\n"
+            f"  'distance': {'incomplete' if has_distance else 'absent'}\n"
+            f"  'length':   {'incomplete (missing: ' + str(missing_len) + ')' if has_length else 'absent'}\n"
+            f"Ensure at least one column is complete before running."
+        )
+
+    # Drop working columns
+    for col in ("_dist_raw", "_len_raw"):
+        if col in df.columns:
+            df = df.drop(columns=[col])
 
     # AC lines only: below 350 kV (HVDC threshold) and at/above 110 kV
     n_before = len(df)
@@ -431,6 +505,7 @@ def add_carriers(network: pypsa.Network) -> pypsa.Network:
 def add_buses(
     network: pypsa.Network,
     df_nodes: pd.DataFrame,
+    df_lines: pd.DataFrame,
     multi_volt_sites: Dict,
     dc_sites: set,
     island: Optional[str] = None,
@@ -466,6 +541,24 @@ def add_buses(
         log.info("    Island filter '%s': %d/%d buses", island, len(df), len(df_nodes))
     else:
         df = df_nodes.copy()
+
+    # Further filter to only sites that appear as line or link endpoints.
+    # nodes.csv is a master register -- only sites referenced in
+    # lines_data_si.csv (or links_data.csv) are actual network buses.
+    # Junction nodes (JCT_*) and DC sites are included automatically.
+    transmission_sites = set()
+    for _, row in df_lines.iterrows():
+        for col in ("bus0", "bus1"):
+            s = str(row[col]).strip().upper()
+            transmission_sites.add(s)
+            # Also add the base site without voltage suffix
+            base = s.rsplit("_", 1)[0] if "_" in s else s
+            transmission_sites.add(base)
+    for site in dc_sites:
+        transmission_sites.add(site)
+
+    df = df[df["site"].str.upper().isin(transmission_sites)].copy()
+    log.info("    Line endpoint filter: %d transmission buses", len(df))
 
     added = 0
     skipped = 0
@@ -585,7 +678,7 @@ def add_lines(
             type=line_type,
             num_parallel=num_parallel,
             carrier="AC",
-            s_nom_extendable=True,
+            s_nom_extendable=False,
         )
         added += 1
 
@@ -617,6 +710,7 @@ def add_transformers(
     -------
     pypsa.Network
     """
+    register_custom_transformer_types(network)
     log.info("\n  Adding transformers at multi-voltage substations")
 
     # Build lookup of available transformer types from PyPSA
@@ -768,10 +862,19 @@ def add_generators(
     """
     log.info("\n  Adding generators (all dormant)")
 
+    # Pre-filter to generators whose bus exists in this network.
+    # When building a single-island network, NI generators are silently
+    # excluded rather than generating a warning per skipped generator.
+    network_buses = set(network.buses.index)
+    df_gen_filtered = df_gen[df_gen["bus"].isin(network_buses)].copy()
+    n_excluded = len(df_gen) - len(df_gen_filtered)
+    if n_excluded > 0:
+        log.info("    Excluded %d generators not in this island network", n_excluded)
+
     added   = 0
     skipped = 0
 
-    for _, row in df_gen.iterrows():
+    for _, row in df_gen_filtered.iterrows():
         bus_name = row["bus"]   # already resolved in generator_registry.csv
 
         if bus_name not in network.buses.index:
@@ -809,57 +912,152 @@ def add_loads(
     network: pypsa.Network,
     df_export: pd.DataFrame,
     snapshots: pd.DatetimeIndex,
+    df_nodes: pd.DataFrame,
+    config: dict = None,
+    island: str = None,
 ) -> pypsa.Network:
     """
     Add load timeseries to the network.
 
-    Only sites present in both df_export and the network bus list receive
-    a load component.  The snapshot index is used to slice the annual
-    timeseries to the correct period.
+    ALL export sites are included as loads. Sites that are transmission
+    buses receive their load directly. Sites that are not in the network
+    (sub-transmission GXPs) are automatically aggregated to their nearest
+    connected transmission bus by straight-line distance.
 
-    Parameters
-    ----------
-    network : pypsa.Network
-    df_export : pd.DataFrame
-        Annual export timeseries (MWh per interval, columns=site codes).
-    snapshots : pd.DatetimeIndex
-        Snapshot index for this network period.
-
-    Returns
-    -------
-    pypsa.Network
+    This ensures the total modelled load equals total measured generation
+    plus HVDC import, allowing a balanced power flow verification.
     """
+    import math
+
     log.info("\n  Adding loads")
 
-    # Align export data to snapshots
-    df_slice = df_export.reindex(snapshots)
+    # Build coordinate lookup for all nodes
+    node_coords = {}
+    for _, row in df_nodes.iterrows():
+        site = str(row["site"]).strip().upper()
+        try:
+            lat  = float(row["lat"])
+            lon  = float(row["long"])
+            if not (math.isnan(lat) or math.isnan(lon)):
+                node_coords[site] = (lat, lon)
+        except (ValueError, TypeError):
+            pass
 
-    added   = 0
-    skipped = 0
+    # Network buses (AC transmission only -- exclude DC buses)
+    ac_net_buses = set(
+        b for b in network.buses.index
+        if network.buses.loc[b, "carrier"] == "AC"
+    )
+
+    # Build aggregation map: for each export site, find target bus
+    # Manual overrides from config take precedence
+    manual_agg = {}
+    if config:
+        for child, parent in config.get(
+                "sub_transmission_aggregation", {}).items():
+            manual_agg[child.upper()] = parent.upper()
+
+    def nearest_bus(site: str) -> str:
+        """Find nearest connected AC transmission bus by straight-line distance."""
+        if site in node_coords:
+            lat1, lon1 = node_coords[site]
+            best_bus  = None
+            best_dist = float("inf")
+            for bus in ac_net_buses:
+                # Strip voltage suffix for coord lookup
+                base = bus.rsplit("_", 1)[0] if "_" in bus else bus
+                coords = node_coords.get(bus) or node_coords.get(base)
+                if coords is None:
+                    continue
+                lat2, lon2 = coords
+                dist = math.sqrt((lat2-lat1)**2 + (lon2-lon1)**2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_bus  = bus
+            return best_bus
+        return None
+
+    # Filter export timeseries to this island's sites only.
+    # The all-sites export file contains both NI and SI GXPs.
+    # Using the full file would assign NI loads to SI buses.
+    if island is not None:
+        island_sites = set(
+            str(row["site"]).strip().upper()
+            for _, row in df_nodes.iterrows()
+            if str(row.get("island", "")).strip().upper() == island
+        )
+        export_cols = [c for c in df_export.columns
+                       if c.strip().upper() in island_sites]
+        df_export_island = df_export[export_cols]
+        log.info("    Export filter '%s': %d/%d sites",
+                 island, len(export_cols), len(df_export.columns))
+    else:
+        df_export_island = df_export
+
+    # Align export data to snapshots
+    df_slice = df_export_island.reindex(snapshots).fillna(0.0)
+
+    # Accumulate load per target bus
+    bus_load = {}   # bus -> pd.Series
+    agg_count   = 0
+    direct_count = 0
+    skip_count  = 0
 
     for site in df_slice.columns:
-        if site not in network.buses.index:
-            skipped += 1
+        site_up = site.strip().upper()
+
+        # Determine target bus
+        if site_up in manual_agg:
+            target = manual_agg[site_up]
+        elif site_up in ac_net_buses:
+            target = site_up
+        else:
+            # Auto-aggregate to nearest transmission bus
+            target = nearest_bus(site_up)
+            if target is None:
+                log.debug("    Load %s: no nearby bus -- skipped", site)
+                skip_count += 1
+                continue
+
+        if target not in ac_net_buses:
+            skip_count += 1
             continue
 
-        p_set = df_slice[site].tolist()
+        if target not in bus_load:
+            bus_load[target] = df_slice[site].copy()
+        else:
+            bus_load[target] = bus_load[target] + df_slice[site]
 
-        if len(p_set) != len(snapshots):
-            log.warning("    Load %s: length mismatch %d vs %d -- skipped",
-                        site, len(p_set), len(snapshots))
-            skipped += 1
-            continue
+        if target == site_up:
+            direct_count += 1
+        else:
+            agg_count += 1
 
-        network.add("Load", site, bus=site, p_set=p_set)
+    # Add aggregated loads to network
+    added = 0
+    for bus, p_series in bus_load.items():
+        if p_series.abs().max() < 0.001:
+            continue  # skip negligible loads
+        load_name = bus
+        if load_name not in network.loads.index:
+            network.add("Load", load_name, bus=bus, p_set=0.0)
+        # Always set timeseries via loads_t.p_set to ensure datetime index
+        # is preserved in the exported CSV
+        p_with_index = pd.Series(p_series.values, index=snapshots)
+        if load_name in network.loads_t.p_set.columns:
+            network.loads_t.p_set[load_name] = \
+                network.loads_t.p_set[load_name] + p_with_index.values
+        else:
+            network.loads_t.p_set[load_name] = p_with_index
         added += 1
 
-    log.info("    Added %d loads (%d sites not in network)", added, skipped)
+    log.info("    Direct loads: %d  Aggregated: %d  Skipped: %d  "
+             "Total buses with load: %d",
+             direct_count, agg_count, skip_count, added)
+    log.info("    Total mean load: %.1f MW",
+             sum(s.mean() for s in bus_load.values()))
     return network
 
-
-# =============================================================================
-# SNAPSHOT CONSTRUCTION
-# =============================================================================
 
 def make_snapshots(year: int, month: Optional[int], freq: str) -> pd.DatetimeIndex:
     """
@@ -932,7 +1130,21 @@ def build_base_network(
     # ------------------------------------------------------------------
     log.info("\nLoading static network data")
     df_nodes = load_nodes(paths["nodes"])
-    df_lines = load_lines(paths["lines"])
+
+    # Select lines file based on island scope.
+    # SI-only build uses lines_data_si.csv; NI-only uses lines_data_ni.csv;
+    # full-country build uses lines_data.csv (combined, when available).
+    if island == "SI" and paths["lines_si"].exists():
+        lines_path = paths["lines_si"]
+        log.info("  Island='SI': using %s", lines_path.name)
+    elif island == "NI" and paths["lines_ni"].exists():
+        lines_path = paths["lines_ni"]
+        log.info("  Island='NI': using %s", lines_path.name)
+    else:
+        lines_path = paths["lines"]
+        log.info("  Using combined lines file: %s", lines_path.name)
+
+    df_lines = load_lines(lines_path)
     df_links = load_links(paths["links"])
     df_gen   = load_generator_registry(paths["gen_reg"])
 
@@ -969,12 +1181,12 @@ def build_base_network(
     network.set_snapshots(snapshots)
 
     network = add_carriers(network)
-    network = add_buses(network, df_nodes, multi_volt_sites, dc_sites, island)
+    network = add_buses(network, df_nodes, df_lines, multi_volt_sites, dc_sites, island)
     network = add_lines(network, df_lines, multi_volt_sites)
     network = add_transformers(network, multi_volt_sites, df_nodes)
     network = add_hvdc_links(network, df_links, island)
     network = add_generators(network, df_gen, multi_volt_sites)
-    network = add_loads(network, df_export, snapshots)
+    network = add_loads(network, df_export, snapshots, df_nodes, config=config, island=island)
 
     # ------------------------------------------------------------------
     # Summary
@@ -1029,7 +1241,23 @@ def save_network(
     prefix = f"{island.lower()}_" if island else ""
     folder = paths["networks"] / scenario / str(year) / f"{prefix}{period}"
     folder.mkdir(parents=True, exist_ok=True)
+
+    # Calculate dependent values before saving so that all derived
+    # electrical parameters (x, r, b, s_nom) are written to CSV.
+    # Without this, only the line type name is stored and parameters
+    # must be recomputed every time the network is loaded.
+    network.calculate_dependent_values()
     network.export_to_csv_folder(str(folder))
+
+    # Rewrite loads-p_set.csv with datetime index.
+    # PyPSA 1.0.3 exports with integer index; we overwrite with
+    # datetime strings so downstream scripts can reindex correctly.
+    pset_path = folder / "loads-p_set.csv"
+    if pset_path.exists() and not network.loads_t.p_set.empty:
+        df_pset = network.loads_t.p_set.copy()
+        df_pset.index = network.snapshots
+        df_pset.to_csv(str(pset_path))
+
     log.info("  Saved to: %s", folder)
     return folder
 
@@ -1074,14 +1302,31 @@ def main():
     for year in years:
         for month_num in range(1, 13):
             try:
-                network = build_base_network(
-                    config=config,
-                    paths=paths,
-                    year=year,
-                    month=month_num,
-                    island=None,   # full country
-                )
-                save_network(network, paths, scenario, year, month_num)
+                # Determine which island(s) to build.
+                # If lines_data_si.csv exists but lines_data.csv does not,
+                # build SI only.  Full-country build requires lines_data.csv.
+                if paths["lines"].exists():
+                    islands_to_build = [None]   # full country
+                else:
+                    islands_to_build = []
+                    if paths["lines_si"].exists():
+                        islands_to_build.append("SI")
+                    if paths["lines_ni"].exists():
+                        islands_to_build.append("NI")
+                    if not islands_to_build:
+                        log.error("No lines file found. Expected one of: "
+                                  "lines_data.csv, lines_data_si.csv, lines_data_ni.csv")
+                        continue
+
+                for island in islands_to_build:
+                    network = build_base_network(
+                        config=config,
+                        paths=paths,
+                        year=year,
+                        month=month_num,
+                        island=island,
+                    )
+                    save_network(network, paths, scenario, year, month_num, island)
             except Exception as exc:
                 log.error("Error building %s %d/%d: %s",
                           scenario, year, month_num, exc)

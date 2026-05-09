@@ -1,0 +1,2 @@
+name,s_nom,v_nom_0,v_nom_1,vsc,vscr,phase_shift,tap_side,tap_neutral,tap_min,tap_max,tap_step,references
+630MVA 220/110kV,630.0,,,12.0,0.4,,0,0,-9,9,1.5,
