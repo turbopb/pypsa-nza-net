@@ -83,6 +83,8 @@ CARRIER_COLOURS = {
 
 # Map extent for South Island [lon_min, lon_max, lat_min, lat_max]
 SI_EXTENT = [166.0, 174.5, -46.8, -40.3]
+# Map extent for North Island
+NI_EXTENT = [172.5, 178.7, -41.7, -34.3]
 
 PROJ = ccrs.PlateCarree()
 
@@ -114,11 +116,12 @@ def load_data(workspace: Path, island: str = "SI") -> dict:
         (df_nodes["island"] == island) &
         (~df_nodes["site"].isin(ELECTRODE))
     ].copy()
-    log.info("Nodes loaded: %d SI sites (including junction nodes)",
-             len(df_nodes))
+    log.info("Nodes loaded: %d %s sites (including junction nodes)",
+             len(df_nodes), island)
 
     # Lines
-    df_lines = pd.read_csv(manual_dir / "lines_data_si.csv", dtype=str)
+    lines_file = "lines_data_ni.csv" if island == "NI" else "lines_data_si.csv"
+    df_lines = pd.read_csv(manual_dir / lines_file, dtype=str)
     for col in df_lines.columns:
         if df_lines[col].dtype == object:
             df_lines[col] = df_lines[col].str.strip()
@@ -167,12 +170,12 @@ def load_data(workspace: Path, island: str = "SI") -> dict:
 # MAP SETUP
 # =============================================================================
 
-def make_figure(title: str, dpi: int = 300) -> tuple:
-    """Create a figure with NZ SI cartopy axes."""
+def make_figure(title: str, dpi: int = 300, island: str = "SI") -> tuple:
+    """Create a figure with NZ transmission network cartopy axes."""
     fig = plt.figure(figsize=(10, 14), dpi=dpi)
     ax  = fig.add_subplot(1, 1, 1, projection=PROJ)
 
-    ax.set_extent(SI_EXTENT, crs=PROJ)
+    ax.set_extent(NI_EXTENT if island == "NI" else SI_EXTENT, crs=PROJ)
 
     # Coastline and land
     ax.add_feature(cfeature.LAND,       facecolor="#f5f5f0", zorder=0)
@@ -219,9 +222,9 @@ def get_bus_coords(site: str, volts: int,
 # FIGURE 1: BUSES
 # =============================================================================
 
-def plot_buses(data: dict, out_path: Path, dpi: int = 300):
+def plot_buses(data: dict, out_path: Path, dpi: int = 300, island: str = "SI"):
     """Plot all SI buses coloured by voltage level."""
-    fig, ax = make_figure("South Island Transmission Buses", dpi)
+    fig, ax = make_figure(f"{island} Transmission Buses", dpi, island=island)
     df_nodes = data["nodes"]
 
     for volt, colour in VOLT_COLOURS.items():
@@ -265,9 +268,9 @@ def plot_buses(data: dict, out_path: Path, dpi: int = 300):
 # FIGURE 2: TOPOLOGY
 # =============================================================================
 
-def plot_topology(data: dict, out_path: Path, dpi: int = 300):
+def plot_topology(data: dict, out_path: Path, dpi: int = 300, island: str = "SI"):
     """Plot buses and transmission lines."""
-    fig, ax = make_figure("South Island Transmission Network Topology", dpi)
+    fig, ax = make_figure(f"{island} Transmission Network Topology", dpi, island=island)
     df_nodes = data["nodes"]
     df_lines = data["lines"]
     node_lkp = data["node_lkp"]
@@ -346,10 +349,10 @@ def plot_topology(data: dict, out_path: Path, dpi: int = 300):
 # FIGURE 3: TRANSFORMERS
 # =============================================================================
 
-def plot_transformers(data: dict, out_path: Path, dpi: int = 300):
+def plot_transformers(data: dict, out_path: Path, dpi: int = 300, island: str = "SI"):
     """Plot network topology with transformer locations highlighted."""
     fig, ax = make_figure(
-        "South Island Transmission Network -- Transformer Locations", dpi)
+        f"{island} Transmission Network -- Transformer Locations", dpi, island=island)
     df_lines   = data["lines"]
     node_lkp   = data["node_lkp"]
     multi_volt = data["multi_volt"]
@@ -416,10 +419,10 @@ def plot_transformers(data: dict, out_path: Path, dpi: int = 300):
 # FIGURE 4: GENERATORS
 # =============================================================================
 
-def plot_generators(data: dict, out_path: Path, dpi: int = 300):
+def plot_generators(data: dict, out_path: Path, dpi: int = 300, island: str = "SI"):
     """Plot network topology with generator locations coloured by carrier."""
     fig, ax = make_figure(
-        "South Island Transmission Network -- Generator Locations", dpi)
+        f"{island} Transmission Network -- Generator Locations", dpi, island=island)
     df_lines   = data["lines"]
     node_lkp   = data["node_lkp"]
     multi_volt = data["multi_volt"]
@@ -528,23 +531,27 @@ def main():
 
     plot_buses(
         data,
-        out_dir / "si_buses.png",
-        args.dpi
+        out_dir / f"{args.island.lower()}_buses.png",
+        args.dpi,
+        island=args.island,
     )
     plot_topology(
         data,
-        out_dir / "si_topology.png",
-        args.dpi
+        out_dir / f"{args.island.lower()}_topology.png",
+        args.dpi,
+        island=args.island,
     )
     plot_transformers(
         data,
-        out_dir / "si_transformers.png",
-        args.dpi
+        out_dir / f"{args.island.lower()}_transformers.png",
+        args.dpi,
+        island=args.island,
     )
     plot_generators(
         data,
-        out_dir / "si_generators.png",
-        args.dpi
+        out_dir / f"{args.island.lower()}_generators.png",
+        args.dpi,
+        island=args.island,
     )
 
     log.info("\nDone. Four figures written to: %s", out_dir)

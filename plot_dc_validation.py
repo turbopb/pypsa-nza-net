@@ -104,180 +104,173 @@ def load_flows(year, month):
 
 def plot_network_map(year=2024, month=1):
     """
-    SI network map with lines coloured by mean loading percentage.
-    Publication quality with clear annotations.
+    SI network map with lines coloured by mean loading.
+    Uses cartopy geographic background matching NI style.
     """
-    log.info("Figure 1: Network map (month=%d)", month)
+    try:
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+        from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+        import matplotlib.lines as mlines
+    except ImportError:
+        log.error("cartopy not available -- cannot generate network map")
+        return
+
+    log.info("Figure 1: SI network map (month=%d)", month)
 
     nodes    = load_nodes()
     lines_df = pd.read_csv(str(manual_dir / "lines_data_si.csv"), dtype=str)
+    lines_df.columns = lines_df.columns.str.strip()
     loading  = load_loading(year, month)
-
     if loading is None:
         log.error("No loading data for %d/%d", year, month)
         return
+
+    PROJ      = ccrs.PlateCarree()
+    SI_EXTENT = [166.0, 174.5, -46.8, -40.3]
 
     def get_coords(site):
         site = str(site).strip().upper()
         if site in nodes.index:
             row = nodes.loc[site]
             if pd.notna(row["lat"]) and pd.notna(row["long"]):
-                return float(row["lat"]), float(row["long"])
-        base = site.rsplit("_", 1)[0]
+                return float(row["long"]), float(row["lat"])
+        base = site.rsplit("_", 1)[0] if not site.startswith("JCT_") else site
         if base in nodes.index:
             row = nodes.loc[base]
             if pd.notna(row["lat"]) and pd.notna(row["long"]):
-                return float(row["lat"]), float(row["long"])
-        return None
+                return float(row["long"]), float(row["lat"])
+        return None, None
 
     cmap = matplotlib.colormaps["RdYlGn_r"]
     norm = mcolors.Normalize(vmin=0, vmax=100)
 
-    fig, ax = plt.subplots(figsize=(10, 16), facecolor="#f5f4f0")
-    ax.set_facecolor("#eaeef2")
+    fig = plt.figure(figsize=(14, 10), dpi=300)
+    ax  = fig.add_subplot(1, 1, 1, projection=PROJ)
+    ax.set_extent(SI_EXTENT, crs=PROJ)
+    ax.add_feature(cfeature.LAND,      facecolor="#f5f5f0", zorder=0)
+    ax.add_feature(cfeature.OCEAN,     facecolor="#d6eaf8", zorder=0)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor="#555555", zorder=1)
+    ax.add_feature(cfeature.RIVERS,    linewidth=0.3, edgecolor="#aed6f1",
+                   facecolor="none", zorder=1)
+    ax.add_feature(cfeature.LAKES,     facecolor="#aed6f1", edgecolor="#aed6f1",
+                   zorder=1)
+    gl = ax.gridlines(draw_labels=True, linewidth=0.3,
+                      color="gray", alpha=0.5, linestyle="--")
+    gl.top_labels   = False
+    gl.right_labels = False
+    gl.xformatter   = LONGITUDE_FORMATTER
+    gl.yformatter   = LATITUDE_FORMATTER
+    gl.xlabel_style = {"size": 8}
+    gl.ylabel_style = {"size": 8}
 
     plotted_buses = set()
+    line_loadings = []
 
     # --- Draw lines ---
     for _, row in lines_df.iterrows():
-        cols  = lines_df.columns.tolist()
         line_id = str(row.iloc[0]).strip()
-        # Find bus columns by position (lines_data_si: id,name,desc,bus0,bus1,...)
         b0 = str(row.iloc[3]).strip().upper()
         b1 = str(row.iloc[4]).strip().upper()
-
-        c0 = get_coords(b0)
-        c1 = get_coords(b1)
-        if c0 is None or c1 is None:
+        x0, y0 = get_coords(b0)
+        x1, y1 = get_coords(b1)
+        if None in (x0, y0, x1, y1):
             continue
-
         plotted_buses.add(b0)
         plotted_buses.add(b1)
-
         pct = float(loading.loc[line_id, "mean_loading_pct"]) \
               if line_id in loading.index else 0.0
         mx  = float(loading.loc[line_id, "max_loading_pct"]) \
               if line_id in loading.index else 0.0
-
         color = cmap(norm(pct))
-        # Line thickness dramatically scaled: thin=lightly loaded, thick=heavily loaded
-        lw    = 0.8 + (pct / 100) ** 1.5 * 8.0
+        lw    = 1.0 + (pct / 100) ** 1.5 * 7.0
+        ax.plot([x0, x1], [y0, y1], color=color, linewidth=lw,
+                solid_capstyle="round", transform=PROJ, zorder=3, alpha=0.9)
+        line_loadings.append((pct, line_id, x0, y0, x1, y1, mx))
 
-        ax.plot([c0[1], c1[1]], [c0[0], c1[0]],
-                color=color, linewidth=lw,
-                solid_capstyle="round", zorder=2,
-                alpha=0.9)
+    # --- Annotate top 3 lines -- boxes in Tasman Sea west of network ---
+    line_loadings.sort(reverse=True)
+    sea_positions = [
+        (166.4, -41.8),
+        (166.4, -43.0),
+        (166.4, -44.2),
+    ]
+    for i, (pct, line_id, x0, y0, x1, y1, mx) in enumerate(line_loadings[:3]):
+        mid_lon = (x0 + x1) / 2
+        mid_lat = (y0 + y1) / 2
+        txt_lon, txt_lat = sea_positions[i]
+        label = "{:s}  {:.0f}% mean\n(max {:.0f}%)".format(line_id, pct, mx)
+        ax.annotate(
+            label,
+            xy=(mid_lon, mid_lat),
+            xytext=(txt_lon, txt_lat),
+            fontsize=8.5, color="#1a1a1a", fontweight="bold",
+            xycoords=PROJ._as_mpl_transform(ax),
+            textcoords=PROJ._as_mpl_transform(ax),
+            arrowprops=dict(arrowstyle="-", color="#333333", lw=0.9),
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
+                      edgecolor="#666666", alpha=0.95, linewidth=0.8),
+            zorder=8, ha="left"
+        )
 
-        # Label lines with mean loading > 25%
-        if pct > 25:
-            mid_lat = (c0[0] + c1[0]) / 2
-            mid_lon = (c0[1] + c1[1]) / 2
-            ax.annotate(
-                f"{line_id}  {pct:.0f}% mean\n(max {mx:.0f}%)",
-                xy=(mid_lon, mid_lat),
-                xytext=(mid_lon + 0.12, mid_lat + 0.04),
-                fontsize=6.5, color="#1a1a1a",
-                fontweight="bold",
-                arrowprops=dict(arrowstyle="-",
-                                color="#555555",
-                                lw=0.7),
-                bbox=dict(boxstyle="round,pad=0.3",
-                          facecolor="white",
-                          edgecolor="#aaaaaa",
-                          alpha=0.92),
-                zorder=6
-            )
-
-    # --- Bus categories ---
+    # --- Draw buses ---
     gen_buses  = {"MAN","BEN","CYD","ROX","OHA","OHB","OHC","AVI",
                   "TKB","ARG","BWK","GOR","WTK","COL","TKA","NMA","STK"}
     load_buses = {"ISL","TWI","INV","TIM","BLN","HWB","NWD","TWZ",
                   "CML","KIK","ABY","ORO"}
-
-    # Manual label offsets (lon, lat) for key buses to avoid overlap
-    label_offsets = {
-        "MAN":  (-0.55,  0.02), "BEN":  (-0.40,  0.05),
-        "CYD":  (-0.35, -0.06), "ROX":  ( 0.07,  0.04),
-        "OHA":  (-0.42,  0.04), "OHB":  (-0.42, -0.04),
-        "OHC":  (-0.42, -0.10), "AVI":  ( 0.07,  0.04),
-        "TKB":  (-0.35,  0.05), "ARG":  ( 0.07,  0.02),
-        "WTK":  ( 0.07, -0.05), "GOR":  ( 0.07,  0.03),
-        "ISL":  ( 0.07,  0.04), "TWI":  ( 0.07,  0.02),
-        "INV":  (-0.38, -0.05), "TIM":  ( 0.08,  0.02),
-        "BLN":  ( 0.08,  0.02), "NWD":  ( 0.08, -0.05),
-        "HWB":  ( 0.08,  0.02), "KIK":  ( 0.08,  0.02),
-        "STK":  ( 0.08,  0.02), "NMA":  (-0.38,  0.02),
-        "TWZ":  ( 0.08,  0.02), "CML":  (-0.35,  0.02),
-        "ABY":  ( 0.08,  0.02), "ORO":  (-0.35,  0.02),
-        "TKA":  ( 0.08,  0.02), "MCH":  ( 0.08,  0.02),
-    }
-
     key_labels = {"MAN","BEN","CYD","ROX","OHA","OHB","OHC","AVI","TKB",
                   "ISL","TWI","INV","TIM","BLN","HWB","NWD","KIK","STK",
                   "NMA","WTK","CML","TWZ","ARG","GOR","TKA","ABY","ORO",
                   "MCH","NSY"}
 
     for bus in plotted_buses:
-        c = get_coords(bus)
-        if c is None:
+        x, y = get_coords(bus)
+        if x is None:
             continue
-        base = bus.rsplit("_", 1)[0]
-
+        base = bus.rsplit("_", 1)[0] if not bus.startswith("JCT_") else bus
         if base in gen_buses:
             ms, mk, mc, zord = 8, "o", "#1565C0", 4
         elif base in load_buses:
             ms, mk, mc, zord = 7, "s", "#B71C1C", 4
         else:
             ms, mk, mc, zord = 4, "o", "#546E7A", 3
-
-        ax.plot(c[1], c[0], mk, color=mc,
-                markersize=ms, zorder=zord,
-                markeredgecolor="white",
-                markeredgewidth=1.0)
-
+        ax.plot(x, y, mk, color=mc, markersize=ms, zorder=zord,
+                markeredgecolor="white", markeredgewidth=0.8, transform=PROJ)
         if base in key_labels:
-            off_lon, off_lat = label_offsets.get(base, (0.07, 0.02))
-            ax.text(c[1] + off_lon, c[0] + off_lat,
-                    base,
-                    fontsize=7.5,
-                    color="#111111",
-                    fontweight="bold",
-                    va="center",
-                    bbox=dict(boxstyle="round,pad=0.15",
-                              facecolor="white",
-                              edgecolor="none",
-                              alpha=0.8),
-                    zorder=7)
+            ax.annotate(base, xy=(x, y), xytext=(4, 4),
+                        textcoords="offset points",
+                        fontsize=6.5, color="#111111", fontweight="bold",
+                        transform=PROJ, zorder=7,
+                        bbox=dict(boxstyle="round,pad=0.15",
+                                  facecolor="white", edgecolor="none",
+                                  alpha=0.8))
 
     # --- Colourbar ---
     sm = cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, shrink=0.3, pad=0.02,
-                        aspect=18, location="right")
+    cbar = fig.colorbar(sm, ax=ax, shrink=0.25, pad=0.02,
+                        aspect=16, location="right")
     cbar.set_label("Mean line loading (%)", fontsize=9)
     cbar.ax.tick_params(labelsize=8)
     cbar.set_ticks([0, 25, 50, 75, 100])
 
     # --- Legend ---
     legend_elements = [
-        Line2D([0],[0], marker="o", color="w",
-               markerfacecolor="#1565C0", markersize=9,
-               markeredgecolor="white",
-               label="Generation bus"),
-        Line2D([0],[0], marker="s", color="w",
-               markerfacecolor="#B71C1C", markersize=8,
-               markeredgecolor="white",
-               label="Load / substation bus"),
-        Line2D([0],[0], marker="o", color="w",
-               markerfacecolor="#546E7A", markersize=6,
-               markeredgecolor="white",
-               label="Junction / transformer bus"),
-        Line2D([0],[0], color=cmap(norm(0)),
-               linewidth=2.5, label="Lightly loaded line"),
-        Line2D([0],[0], color=cmap(norm(50)),
-               linewidth=3.5, label="Moderately loaded line"),
-        Line2D([0],[0], color=cmap(norm(90)),
-               linewidth=5.0, label="Heavily loaded line"),
+        mlines.Line2D([0],[0], marker="o", color="w",
+                      markerfacecolor="#1565C0", markersize=9,
+                      markeredgecolor="white", label="Generation bus"),
+        mlines.Line2D([0],[0], marker="s", color="w",
+                      markerfacecolor="#B71C1C", markersize=8,
+                      markeredgecolor="white", label="Load / substation bus"),
+        mlines.Line2D([0],[0], marker="o", color="w",
+                      markerfacecolor="#546E7A", markersize=6,
+                      markeredgecolor="white", label="Junction / transformer bus"),
+        mlines.Line2D([0],[0], color=cmap(norm(10)),
+                      linewidth=2.0, label="Lightly loaded line"),
+        mlines.Line2D([0],[0], color=cmap(norm(50)),
+                      linewidth=3.5, label="Moderately loaded line"),
+        mlines.Line2D([0],[0], color=cmap(norm(90)),
+                      linewidth=5.0, label="Heavily loaded line"),
     ]
     ax.legend(handles=legend_elements, loc="lower left",
               fontsize=8, framealpha=0.95,
@@ -287,20 +280,15 @@ def plot_network_map(year=2024, month=1):
                   "July","August","September","October","November",
                   "December"][month-1]
     ax.set_title(
-        f"South Island Transmission Network\n"
-        f"DC Power Flow Validation — {month_name} {year}\n"
-        f"Lines coloured and weighted by mean loading (% of rated capacity)",
-        fontsize=10, pad=14, fontweight="bold"
+        "South Island Transmission Network\n"
+        "DC Power Flow Validation -- {} {}\n"
+        "Lines coloured and weighted by mean loading (% of rated capacity)"
+        .format(month_name, year),
+        fontsize=11, fontweight="bold", pad=12
     )
-    ax.set_xlabel("Longitude (°E)", fontsize=9)
-    ax.set_ylabel("Latitude (°S)", fontsize=9)
-    ax.tick_params(labelsize=8)
-    ax.grid(True, alpha=0.2, linewidth=0.5, color="#888888")
-    ax.set_xlim(166.2, 174.2)
-    ax.set_ylim(-47.2, -40.4)
 
     fig.tight_layout()
-    out = fig_dir / f"si_network_loading_{month_name.lower()}{year}.png"
+    out = fig_dir / "si_network_loading_{}{}.png".format(month_name.lower(), year)
     fig.savefig(str(out), dpi=300, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)

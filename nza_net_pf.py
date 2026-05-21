@@ -119,15 +119,16 @@ def load_network(network_dir: Path) -> pypsa.Network:
     return n
 
 
-def load_si_import(workspace: Path,
+def load_island_import(workspace: Path,
                    year: int,
-                   snapshots: pd.DatetimeIndex) -> pd.DataFrame:
+                   snapshots: pd.DatetimeIndex,
+                   island: str = "SI") -> pd.DataFrame:
     nodes_path = workspace / "data" / "manual" / "nodes.csv"
     si_sites   = set()
     if nodes_path.exists():
         df_n = pd.read_csv(str(nodes_path), dtype=str)
         for _, row in df_n.iterrows():
-            if str(row.get("island","")).strip().upper() == "SI":
+            if str(row.get("island","")).strip().upper() == island.upper():
                 si_sites.add(str(row.get("site","")).strip().upper())
     imp_path = (workspace / "data" / "processed" / "annual"
                 / f"{year}_import_sites_all.csv")
@@ -135,9 +136,9 @@ def load_si_import(workspace: Path,
     df.index = df.index.tz_localize(None)
     si_cols  = [c for c in df.columns if c.strip().upper() in si_sites]
     df_si    = df[si_cols].reindex(snapshots).fillna(0.0)
-    log.info("  SI GIP sites: %d  mean=%.1f MW",
+    log.info("  %s GIP sites: %d  mean=%.1f MW", island,
              len(df_si.columns), df_si.sum(axis=1).mean())
-    log.info("  SI GIP site codes: %s", sorted(df_si.columns.tolist()))
+    log.info("  %s GIP site codes: %s", island, sorted(df_si.columns.tolist()))
     return df_si
 
 
@@ -165,7 +166,8 @@ def load_hvdc(workspace: Path,
 
 def setup_lpf(n: pypsa.Network,
               df_import: pd.DataFrame,
-              hvdc: pd.Series) -> pypsa.Network:
+              hvdc,
+              island: str = "SI") -> pypsa.Network:
     """
     Set generators_t.p_set from measured GIP data for n.lpf().
 
@@ -176,12 +178,38 @@ def setup_lpf(n: pypsa.Network,
     """
     log.info("\nConfiguring network for n.lpf()...")
 
-    # Identify slack generator (first generator at BEN)
+    # Identify slack generator.
+    # SI: BEN (Benmore hydro) absorbs residual.
+    # NI: HAY (Haywards HVDC terminal) acts as slack -- it represents
+    #     the Cook Strait HVDC import which balances the NI in standalone mode.
+    #     HAY has no generator in the registry so we add a temporary one.
+    slack_site = "HAY" if island == "NI" else "BEN"
     slack_gen = next(
         (g for g in n.generators.index
-         if n.generators.loc[g, "bus"].startswith("BEN")),
-        n.generators.index[0]
+         if n.generators.loc[g, "bus"].startswith(slack_site)),
+        None
     )
+    if slack_gen is None and island == "NI":
+        # Add HAY as slack generator -- represents HVDC import from SI
+        slack_gen = "HAY_hvdc_slack"
+        if slack_gen not in n.generators.index:
+            hay_bus = next(
+                (b for b in n.buses.index if b.startswith("HAY") and
+                 n.buses.loc[b, "carrier"] == "AC"),
+                None
+            )
+            if hay_bus:
+                n.add("Generator", slack_gen, bus=hay_bus,
+                      p_nom=2000.0, carrier="AC",
+                      control="Slack", p_set=0.0)
+                n.generators_t.p_set[slack_gen] = pd.Series(
+                    0.0, index=n.snapshots)
+                log.info("  Added HAY HVDC slack generator at bus %s", hay_bus)
+            else:
+                log.warning("  HAY bus not found -- falling back to first generator")
+                slack_gen = n.generators.index[0]
+    elif slack_gen is None:
+        slack_gen = n.generators.index[0]
     log.info("  Slack generator (residual absorber): %s", slack_gen)
 
     # Designate slack bus for PyPSA lpf -- without this, lpf picks the
@@ -217,8 +245,8 @@ def setup_lpf(n: pypsa.Network,
                 n.generators_t.p_set[gen] = pd.Series(0.0, index=n.snapshots)
                 log.warning("  %-25s no GIP data -- zero", gen)
 
-    # HVDC as negative load at BEN
-    if "BEN" in n.buses.index and hvdc.abs().max() > 0:
+    # HVDC as negative load at BEN (SI only -- hvdc is None for NI)
+    if hvdc is not None and "BEN" in n.buses.index and hvdc.abs().max() > 0:
         lname = "inj_HVDC_BEN"
         if lname not in n.loads.index:
             n.add("Load", lname, bus="BEN", p_set=0.0)
@@ -436,7 +464,7 @@ def run_lpf(n: pypsa.Network,
                linewidth=1.2, label="Rated capacity")
     ax.axvline(75,  color="orange", linestyle=":",
                linewidth=1.0, label="75% threshold")
-    ax.set_title(f"SI Line Loading -- PyPSA n.lpf() -- {month_label}")
+    ax.set_title(f"Line Loading -- DC Power Flow -- {month_label}")
     ax.set_xlabel("Max loading (% of rated capacity)")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3, axis="x")
@@ -462,6 +490,8 @@ def main():
         description="Power flow verification using PyPSA n.lpf()")
     parser.add_argument("--year",  type=int, default=2024)
     parser.add_argument("--month", type=int, default=1)
+    parser.add_argument("--island", type=str, default="SI",
+                        help="Island to validate: SI or NI (default: SI)")
     args = parser.parse_args()
 
     _root = os.environ.get("PYPSA_NZA_ROOT", "")
@@ -471,15 +501,17 @@ def main():
 
     workspace   = Path(_root) / "pypsa_nza_workspace"
     month_label = f"{MONTHS[args.month-1]}_{args.year}"
+    island      = args.island.upper()
     net_dir     = (workspace / "models" / "networks" / "reference"
-                   / str(args.year) / f"si_{month_label}")
+                   / str(args.year) / f"{island.lower()}_{month_label}")
     out_dir     = (workspace / "outputs" / "verification_pf"
-                   / str(args.year) / month_label)
+                   / island / str(args.year) / month_label)
 
     log.info("=" * 60)
-    log.info("POWER FLOW VERIFICATION -- PyPSA n.lpf()")
+    log.info("POWER FLOW VERIFICATION -- DC Power Flow (%s)", island)
     log.info("Linearised DC power flow (direct solution)")
     log.info("=" * 60)
+    log.info("Island  : %s", island)
     log.info("Network : %s", net_dir)
     log.info("Month   : %s", month_label)
 
@@ -491,10 +523,10 @@ def main():
     n = load_network(net_dir)
 
     log.info("\nLoading timeseries...")
-    df_import = load_si_import(workspace, args.year, n.snapshots)
-    hvdc      = load_hvdc(workspace, args.year, args.month, n.snapshots)
+    df_import = load_island_import(workspace, args.year, n.snapshots, island)
+    hvdc      = load_hvdc(workspace, args.year, args.month, n.snapshots) if island == "SI" else None
 
-    n       = setup_lpf(n, df_import, hvdc)
+    n       = setup_lpf(n, df_import, hvdc, island=island)
     results = run_lpf(n, out_dir, month_label)
 
     log.info("\n%s", "=" * 60)

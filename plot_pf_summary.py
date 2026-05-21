@@ -42,11 +42,12 @@ MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 YEARS = [2024, 2025]
 
-# S-37 is ISL-KIK 220 kV -- the validated binding winter constraint
-HIGHLIGHT_LINE = "S-37"
+# Binding constraint line -- S-37 for SI, N-87 for NI
+HIGHLIGHT_LINE_SI = "S-37"
+HIGHLIGHT_LINE_NI = "N-87"
 
 
-def load_all_results(workspace: Path) -> pd.DataFrame:
+def load_all_results(workspace: Path, island: str = "SI") -> pd.DataFrame:
     """
     Load line_loading.csv for all 24 months.
     Returns DataFrame: index=line_id, columns=MultiIndex(year, month_abbr).
@@ -56,8 +57,12 @@ def load_all_results(workspace: Path) -> pd.DataFrame:
     for year in YEARS:
         for m_idx, m_name in enumerate(MONTHS, start=1):
             month_label = f"{m_name}_{year}"
-            csv_path = (workspace / "outputs" / "verification_pf"
-                        / str(year) / month_label / "line_loading.csv")
+            if island == "SI":
+                csv_path = (workspace / "outputs" / "verification_pf"
+                            / str(year) / month_label / "line_loading.csv")
+            else:
+                csv_path = (workspace / "outputs" / "verification_pf"
+                            / island / str(year) / month_label / "line_loading.csv")
             if not csv_path.exists():
                 log.warning("  Missing: %s", csv_path)
                 continue
@@ -79,7 +84,7 @@ def load_all_results(workspace: Path) -> pd.DataFrame:
     return result
 
 
-def make_figure(data: pd.DataFrame, top_n: int, out_path: Path):
+def make_figure(data: pd.DataFrame, top_n: int, out_path: Path, island: str = "SI"):
     """
     Two-panel figure:
       Top:    Heatmap of top-N most loaded lines across all months
@@ -97,13 +102,14 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path):
         for m in MONTH_LABELS:
             col_labels.append(f"{m}\n{year}")
 
-    # --- Custom colormap: white → steel blue → orange → red ---
+    # --- Grayscale colormap: white (0%) → dark grey (100%+) ---
+    # Chosen for print legibility and thesis consistency.
     cmap = LinearSegmentedColormap.from_list(
-        "loading",
-        [(0.00, "#f7fbff"),
-         (0.50, "#4292c6"),
-         (0.75, "#fd8d3c"),
-         (1.00, "#d73027")],
+        "loading_grey",
+        [(0.00, "#ffffff"),
+         (0.50, "#aaaaaa"),
+         (0.75, "#555555"),
+         (1.00, "#111111")],
     )
 
     # --- Figure layout ---
@@ -134,7 +140,7 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path):
             val = heatmap_arr[r, c]
             if np.isnan(val):
                 continue
-            txt_col = "white" if val > 65 else "#333333"
+            txt_col = "white" if val > 55 else "#111111"
             ax_heat.text(c, r, f"{val:.0f}",
                          ha="center", va="center",
                          fontsize=6.5, color=txt_col, fontweight="bold")
@@ -147,7 +153,7 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path):
     ax_heat.set_yticks(range(len(top_lines)))
     ax_heat.set_yticklabels(top_lines, fontsize=8, fontfamily="monospace")
     ax_heat.set_title(
-        f"SI Transmission Line Loading — Top {top_n} Lines (Max % of Rated Capacity)",
+        f"{island} Transmission Line Loading — Top {top_n} Lines (Max % of Rated Capacity)",
         fontsize=11, fontweight="bold", pad=8,
     )
 
@@ -166,11 +172,12 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path):
     cbar.ax.tick_params(labelsize=7)
 
     # Highlight 100% on colourbar
-    cbar.ax.axhline(100 / 110, color="red", linewidth=1.2, linestyle="--")
+    cbar.ax.axhline(100 / 110, color="#111111", linewidth=1.2, linestyle="--")
 
     # ----------------------------------------------------------------
     # BOTTOM PANEL: S-37 bar chart
     # ----------------------------------------------------------------
+    HIGHLIGHT_LINE = HIGHLIGHT_LINE_NI if island == "NI" else HIGHLIGHT_LINE_SI
     if HIGHLIGHT_LINE in data.index:
         s37 = data.loc[HIGHLIGHT_LINE]
     else:
@@ -183,21 +190,21 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path):
     bar_colors = []
     for v in bar_vals:
         if np.isnan(v):
-            bar_colors.append("#cccccc")
+            bar_colors.append("#dddddd")
         elif v >= 100:
-            bar_colors.append("#d73027")
+            bar_colors.append("#111111")
         elif v >= 75:
-            bar_colors.append("#fd8d3c")
+            bar_colors.append("#555555")
         else:
-            bar_colors.append("#4292c6")
+            bar_colors.append("#aaaaaa")
 
     bars = ax_bar.bar(x_pos, bar_vals, color=bar_colors,
                       edgecolor="white", linewidth=0.4, width=0.75)
 
     # 100% and 75% threshold lines
-    ax_bar.axhline(100, color="#d73027", linestyle="--",
+    ax_bar.axhline(100, color="#111111", linestyle="--",
                    linewidth=1.2, label="100% rated")
-    ax_bar.axhline(75,  color="#fd8d3c", linestyle=":",
+    ax_bar.axhline(75,  color="#555555", linestyle=":",
                    linewidth=1.0, label="75% threshold")
 
     # Year divider
@@ -209,7 +216,7 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path):
         f"{bar_vals[peak_idx]:.1f}%",
         xy=(x_pos[peak_idx], bar_vals[peak_idx]),
         xytext=(0, 5), textcoords="offset points",
-        ha="center", fontsize=8, fontweight="bold", color="#d73027",
+        ha="center", fontsize=8, fontweight="bold", color="#111111",
     )
 
     ax_bar.set_xticks(x_pos)
@@ -218,7 +225,9 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path):
     ax_bar.set_ylim(0, 115)
     ax_bar.yaxis.set_major_locator(ticker.MultipleLocator(25))
     ax_bar.set_title(
-        f"S-37 (ISL–KIK 220 kV) — Monthly Maximum Loading",
+        ("N-87 (HAY-TKR 110 kV) -- Monthly Maximum Loading"
+         if island == "NI" else
+         "S-37 (ISL-KIK 220 kV) -- Monthly Maximum Loading"),
         fontsize=11, fontweight="bold", pad=8,
     )
     ax_bar.legend(fontsize=8, loc="upper right")
@@ -244,6 +253,8 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path):
 def main():
     parser = argparse.ArgumentParser(
         description="Cross-month SI power flow summary figure")
+    parser.add_argument("--island", type=str, default="SI",
+                        help="Island to plot: SI or NI (default: SI)")
     parser.add_argument("--top-n", type=int, default=20,
                         help="Number of most loaded lines in heatmap (default 20)")
     parser.add_argument("--out",   type=str, default=None,
@@ -256,15 +267,16 @@ def main():
         sys.exit(1)
 
     workspace = Path(_root) / "pypsa_nza_workspace"
+    island    = args.island.upper()
     out_path  = Path(args.out) if args.out else (
-        workspace / "outputs" / "verification_pf" / "pf_summary.png"
+        workspace / "outputs" / "verification_pf" / f"{island.lower()}_pf_summary.png"
     )
 
     log.info("Loading 24-month power flow results...")
-    data = load_all_results(workspace)
+    data = load_all_results(workspace, island)
 
     log.info("Generating figure (top %d lines)...", args.top_n)
-    make_figure(data, top_n=args.top_n, out_path=out_path)
+    make_figure(data, top_n=args.top_n, out_path=out_path, island=island)
 
 
 if __name__ == "__main__":

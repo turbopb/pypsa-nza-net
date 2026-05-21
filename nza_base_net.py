@@ -560,12 +560,40 @@ def add_buses(
     df = df[df["site"].str.upper().isin(transmission_sites)].copy()
     log.info("    Line endpoint filter: %d transmission buses", len(df))
 
+    # Build voltage lookup from lines data -- authoritative for transmission voltage.
+    # nodes.csv volts column reflects distribution connection voltage which
+    # is not the same as the transmission bus voltage. For single-voltage
+    # sites, use the voltage from the line endpoints. For multi-voltage sites,
+    # the voltage is already handled by multi_volt_sites.
+    #
+    # JCT_ junction nodes must NOT be base-stripped -- their full name is
+    # their site code. Only strip the voltage suffix for multi-voltage sites
+    # like ROX_220 or SFD_110 (numeric suffix, 2-3 digits).
+    import re as _re
+    _volt_suffix = _re.compile(r"_(\d{2,3})$")
+
+    site_volt_from_lines: Dict[str, int] = {}
+    for _, lrow in df_lines.iterrows():
+        v = int(lrow["volts"])
+        for col in ("bus0", "bus1"):
+            s = str(lrow[col]).strip()
+            # Strip numeric voltage suffix (e.g. ROX_220 -> ROX)
+            # but keep JCT_ names and plain site codes intact
+            m = _volt_suffix.search(s)
+            base = s[:m.start()] if m else s
+            if base not in site_volt_from_lines:
+                site_volt_from_lines[base] = v
+            # If site appears at multiple voltages it will be in
+            # multi_volt_sites and handled separately -- keep highest voltage
+            # to avoid assigning sub-transmission voltage to a 220 kV bus
+            else:
+                site_volt_from_lines[base] = max(site_volt_from_lines[base], v)
+
     added = 0
     skipped = 0
 
     for _, row in df.iterrows():
         site    = row["site"]
-        volts   = row["volts"]   # may be NaN for junction nodes
         long    = row["long"]
         lat     = row["lat"]
 
@@ -582,9 +610,9 @@ def add_buses(
                 added += 1
             continue
 
-        # AC buses
+        # AC buses -- voltage from lines data, not nodes.csv
         carrier = "AC"
-        v_nom = float(volts) if pd.notna(volts) else 0.0
+        v_nom = float(site_volt_from_lines.get(site, 0))
 
         if site in multi_volt_sites:
             # Create one bus per voltage level for this site
