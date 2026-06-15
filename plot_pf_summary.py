@@ -42,9 +42,10 @@ MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 YEARS = [2024, 2025]
 
-# Binding constraint line -- S-37 for SI, N-87 for NI
+# Binding constraint line -- S-37 for SI, N-87 for NI, HVDC_AC_proxy for COMBINED
 HIGHLIGHT_LINE_SI = "S-37"
 HIGHLIGHT_LINE_NI = "N-87"
+HIGHLIGHT_LINE_COMBINED = "HVDC_AC_proxy"
 
 
 def load_all_results(workspace: Path, island: str = "SI") -> pd.DataFrame:
@@ -60,6 +61,9 @@ def load_all_results(workspace: Path, island: str = "SI") -> pd.DataFrame:
             if island == "SI":
                 csv_path = (workspace / "outputs" / "verification_pf"
                             / str(year) / month_label / "line_loading.csv")
+            elif island == "COMBINED":
+                csv_path = (workspace / "outputs" / "verification_pf"
+                            / "combined" / str(year) / month_label / "line_loading.csv")
             else:
                 csv_path = (workspace / "outputs" / "verification_pf"
                             / island / str(year) / month_label / "line_loading.csv")
@@ -102,14 +106,14 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path, island: str = "S
         for m in MONTH_LABELS:
             col_labels.append(f"{m}\n{year}")
 
-    # --- Grayscale colormap: white (0%) → dark grey (100%+) ---
-    # Chosen for print legibility and thesis consistency.
+    # --- Muted professional colormap: cream → steel blue → amber → brick red ---
+    # Consistent with network loading map colour scheme.
     cmap = LinearSegmentedColormap.from_list(
-        "loading_grey",
-        [(0.00, "#ffffff"),
-         (0.50, "#aaaaaa"),
-         (0.75, "#555555"),
-         (1.00, "#111111")],
+        "loading_muted",
+        [(0.00, "#f7f7f2"),
+         (0.40, "#7aadbe"),
+         (0.70, "#d4a860"),
+         (1.00, "#a63b2b")],
     )
 
     # --- Figure layout ---
@@ -140,10 +144,10 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path, island: str = "S
             val = heatmap_arr[r, c]
             if np.isnan(val):
                 continue
-            txt_col = "white" if val > 55 else "#111111"
+            txt_col = "white" if val > 60 else "#111111"
             ax_heat.text(c, r, f"{val:.0f}",
                          ha="center", va="center",
-                         fontsize=6.5, color=txt_col, fontweight="bold")
+                         fontsize=9, color=txt_col, fontweight="bold")
 
     # Draw year divider
     ax_heat.axvline(11.5, color="#555555", linewidth=1.2, linestyle="--")
@@ -172,12 +176,17 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path, island: str = "S
     cbar.ax.tick_params(labelsize=7)
 
     # Highlight 100% on colourbar
-    cbar.ax.axhline(100 / 110, color="#111111", linewidth=1.2, linestyle="--")
+    cbar.ax.axhline(100 / 110, color="#a63b2b", linewidth=1.2, linestyle="--")
 
     # ----------------------------------------------------------------
     # BOTTOM PANEL: S-37 bar chart
     # ----------------------------------------------------------------
-    HIGHLIGHT_LINE = HIGHLIGHT_LINE_NI if island == "NI" else HIGHLIGHT_LINE_SI
+    if island == "NI":
+        HIGHLIGHT_LINE = HIGHLIGHT_LINE_NI
+    elif island == "COMBINED":
+        HIGHLIGHT_LINE = HIGHLIGHT_LINE_COMBINED
+    else:
+        HIGHLIGHT_LINE = HIGHLIGHT_LINE_SI
     if HIGHLIGHT_LINE in data.index:
         s37 = data.loc[HIGHLIGHT_LINE]
     else:
@@ -192,19 +201,19 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path, island: str = "S
         if np.isnan(v):
             bar_colors.append("#dddddd")
         elif v >= 100:
-            bar_colors.append("#111111")
+            bar_colors.append("#a63b2b")   # muted brick red
         elif v >= 75:
-            bar_colors.append("#555555")
+            bar_colors.append("#d4a860")   # muted amber
         else:
-            bar_colors.append("#aaaaaa")
+            bar_colors.append("#7aadbe")   # muted steel blue
 
     bars = ax_bar.bar(x_pos, bar_vals, color=bar_colors,
                       edgecolor="white", linewidth=0.4, width=0.75)
 
     # 100% and 75% threshold lines
-    ax_bar.axhline(100, color="#111111", linestyle="--",
+    ax_bar.axhline(100, color="#a63b2b", linestyle="--",
                    linewidth=1.2, label="100% rated")
-    ax_bar.axhline(75,  color="#555555", linestyle=":",
+    ax_bar.axhline(75,  color="#d4a860", linestyle=":",
                    linewidth=1.0, label="75% threshold")
 
     # Year divider
@@ -216,7 +225,7 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path, island: str = "S
         f"{bar_vals[peak_idx]:.1f}%",
         xy=(x_pos[peak_idx], bar_vals[peak_idx]),
         xytext=(0, 5), textcoords="offset points",
-        ha="center", fontsize=8, fontweight="bold", color="#111111",
+        ha="center", fontsize=11, fontweight="bold", color="#111111",
     )
 
     ax_bar.set_xticks(x_pos)
@@ -225,9 +234,9 @@ def make_figure(data: pd.DataFrame, top_n: int, out_path: Path, island: str = "S
     ax_bar.set_ylim(0, 115)
     ax_bar.yaxis.set_major_locator(ticker.MultipleLocator(25))
     ax_bar.set_title(
-        ("N-87 (HAY-TKR 110 kV) -- Monthly Maximum Loading"
-         if island == "NI" else
-         "S-37 (ISL-KIK 220 kV) -- Monthly Maximum Loading"),
+        ("N-87 (HAY-TKR 110 kV) -- Monthly Maximum Loading" if island == "NI"
+         else "HVDC_AC_proxy (BEN-HAY 220 kV) -- Monthly Maximum Loading" if island == "COMBINED"
+         else "S-37 (ISL-KIK 220 kV) -- Monthly Maximum Loading"),
         fontsize=11, fontweight="bold", pad=8,
     )
     ax_bar.legend(fontsize=8, loc="upper right")
@@ -254,7 +263,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Cross-month SI power flow summary figure")
     parser.add_argument("--island", type=str, default="SI",
-                        help="Island to plot: SI or NI (default: SI)")
+                        help="Island to plot: SI, NI, or COMBINED (default: SI)")
     parser.add_argument("--top-n", type=int, default=20,
                         help="Number of most loaded lines in heatmap (default 20)")
     parser.add_argument("--out",   type=str, default=None,

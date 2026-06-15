@@ -2,7 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 plot_si_network_loading.py
-Produces 4 individual SI network loading PNGs:
+
+SI network loading maps -- portrait, Jan above Jul, cartopy background.
+Legend: lower LEFT corner (Tasman Sea side).
+Annotation: commented out -- adjust positions manually before uncommenting.
+
+Outputs:
     si_network_loading_january2024.png
     si_network_loading_july2024.png
 """
@@ -17,6 +22,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.cm as cm
 import matplotlib.lines as mlines
+from matplotlib.colors import LinearSegmentedColormap
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
@@ -38,6 +44,15 @@ PROJ      = ccrs.PlateCarree()
 SI_EXTENT = [166.0, 174.5, -46.8, -40.3]
 MONTHS    = ["jan","feb","mar","apr","may","jun",
              "jul","aug","sep","oct","nov","dec"]
+
+# --- Shared muted professional colour palette ---
+CMAP = LinearSegmentedColormap.from_list(
+    "loading_muted",
+    [(0.00, '#f7f7f2'),
+     (0.40, '#7aadbe'),
+     (0.70, '#d4a860'),
+     (1.00, '#a63b2b')],
+)
 
 def load_nodes():
     df = pd.read_csv(str(manual_dir / "nodes.csv"), dtype=str)
@@ -81,7 +96,6 @@ def plot_network_map(year=2024, month=1):
                   "July","August","September","October","November",
                   "December"][month-1]
 
-    cmap = matplotlib.colormaps["RdYlGn_r"]
     norm = mcolors.Normalize(vmin=0, vmax=100)
 
     fig = plt.figure(figsize=(11, 14), dpi=200)
@@ -115,27 +129,31 @@ def plot_network_map(year=2024, month=1):
         plotted_buses.add(b0); plotted_buses.add(b1)
         pct = float(loading.loc[line_id, "mean_loading_pct"]) if line_id in loading.index else 0.0
         mx  = float(loading.loc[line_id, "max_loading_pct"])  if line_id in loading.index else 0.0
-        color = cmap(norm(pct))
+        color = CMAP(norm(pct))
         lw    = 1.0 + (pct / 100) ** 1.5 * 8.0
         ax.plot([x0, x1], [y0, y1], color=color, linewidth=lw,
                 solid_capstyle="round", transform=PROJ, zorder=3, alpha=0.9)
         line_loadings.append((pct, line_id, x0, y0, x1, y1, mx))
 
-    # Single annotation -- highest loaded line only
-    if line_loadings:
-        line_loadings.sort(reverse=True)
-        pct, line_id, x0, y0, x1, y1, mx = line_loadings[0]
-        mid_lon = (x0 + x1) / 2
-        mid_lat = (y0 + y1) / 2
-        label = "{:s}  {:.0f}% mean\n(max {:.0f}%)".format(line_id, pct, mx)
-        ax.annotate(label, xy=(mid_lon, mid_lat), xytext=(166.4, -42.5),
-                    fontsize=10, color="#1a1a1a", fontweight="bold",
-                    xycoords=PROJ._as_mpl_transform(ax),
-                    textcoords=PROJ._as_mpl_transform(ax),
-                    arrowprops=dict(arrowstyle="-", color="#333333", lw=1.0),
-                    bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
-                              edgecolor="#666666", alpha=0.95),
-                    zorder=8, ha="left")
+    # ----------------------------------------------------------------
+    # ANNOTATION -- commented out for manual placement
+    # To re-enable: uncomment the block below and adjust txt_lon, txt_lat
+    # ----------------------------------------------------------------
+    # line_loadings.sort(reverse=True)
+    # pct, line_id, x0, y0, x1, y1, mx = line_loadings[0]
+    # mid_lon = (x0 + x1) / 2
+    # mid_lat = (y0 + y1) / 2
+    # txt_lon, txt_lat = 166.4, -42.5   # <-- adjust position here
+    # label = "{:s}  {:.0f}% mean\n(max {:.0f}%)".format(line_id, pct, mx)
+    # ax.annotate(label, xy=(mid_lon, mid_lat), xytext=(txt_lon, txt_lat),
+    #             fontsize=10, color="#1a1a1a", fontweight="bold",
+    #             xycoords=PROJ._as_mpl_transform(ax),
+    #             textcoords=PROJ._as_mpl_transform(ax),
+    #             arrowprops=dict(arrowstyle="-", color="#333333", lw=1.0),
+    #             bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+    #                       edgecolor="#666666", alpha=0.95),
+    #             zorder=8, ha="left")
+    # ----------------------------------------------------------------
 
     gen_buses  = {"MAN","BEN","CYD","ROX","OHA","OHB","OHC","AVI",
                   "TKB","ARG","BWK","GOR","WTK","COL","TKA","NMA","STK"}
@@ -165,7 +183,7 @@ def plot_network_map(year=2024, month=1):
                         bbox=dict(boxstyle="round,pad=0.12",
                                   facecolor="white", edgecolor="none", alpha=0.8))
 
-    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm = cm.ScalarMappable(cmap=CMAP, norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, shrink=0.3, pad=0.02, aspect=20, location="right")
     cbar.set_label("Mean line loading (%)", fontsize=11)
@@ -179,12 +197,13 @@ def plot_network_map(year=2024, month=1):
                       markersize=9,  markeredgecolor="white", label="Load / substation bus"),
         mlines.Line2D([0],[0], marker="o", color="w", markerfacecolor="#546E7A",
                       markersize=6,  markeredgecolor="white", label="Junction / transformer bus"),
-        mlines.Line2D([0],[0], color=cmap(norm(10)), linewidth=2.0, label="Lightly loaded"),
-        mlines.Line2D([0],[0], color=cmap(norm(50)), linewidth=3.5, label="Moderately loaded"),
-        mlines.Line2D([0],[0], color=cmap(norm(90)), linewidth=6.0, label="Heavily loaded"),
+        mlines.Line2D([0],[0], color=CMAP(norm(10)), linewidth=2.0, label="Lightly loaded"),
+        mlines.Line2D([0],[0], color=CMAP(norm(50)), linewidth=3.5, label="Moderately loaded"),
+        mlines.Line2D([0],[0], color=CMAP(norm(90)), linewidth=6.0, label="Heavily loaded"),
     ]
-    ax.legend(handles=legend_elements, loc="lower left", fontsize=9,
-              framealpha=0.95, edgecolor="#bbbbbb", borderpad=0.8)
+    # SI: legend lower LEFT (Tasman Sea side)
+    ax.legend(handles=legend_elements, loc="lower left",
+              fontsize=9, framealpha=0.95, edgecolor="#bbbbbb", borderpad=0.8)
 
     ax.set_title(
         "South Island Transmission Network\n"

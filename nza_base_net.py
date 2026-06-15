@@ -69,11 +69,11 @@ ELECTRODE_SITES = {"BGR", "THW"}
 
 def get_dc_node_sites(df_links: pd.DataFrame) -> set:
     """
-    Return the set of all bus site codes that appear in links_data.csv.
+    Return the set of DC infrastructure bus site codes from links_data.csv.
 
-    These sites are DC infrastructure nodes and must be added as 350 kV DC
-    buses regardless of what nodes.csv says about their voltage (some
-    intermediate nodes such as OTB have no voltage entry in nodes.csv).
+    With the new single-link HVDC representation (BEN->HAY_220, both AC buses),
+    there are no DC intermediate buses. This function returns an empty set.
+    The old three-segment chain (BEN-DC, FTB, OTB, HAY-DC) is no longer used.
 
     Parameters
     ----------
@@ -81,14 +81,9 @@ def get_dc_node_sites(df_links: pd.DataFrame) -> set:
 
     Returns
     -------
-    set of str
+    set of str  (always empty with single-link HVDC)
     """
-    dc_sites = set()
-    for _, row in df_links.iterrows():
-        if str(row.get("carrier", "")).upper() == "DC":
-            dc_sites.add(str(row["bus0"]).strip())
-            dc_sites.add(str(row["bus1"]).strip())
-    return dc_sites
+    return set()
 
 
 # Minimum AC voltage (kV) for inclusion in the transmission network.
@@ -782,87 +777,44 @@ def add_hvdc_links(
     island: Optional[str],
 ) -> pypsa.Network:
     """
-    Add HVDC links (Cook Strait) to the network.
+    Add Cook Strait HVDC link (single BEN->HAY_220 Link).
 
-    Links are added only when building the full-country network (island=None).
-    The link connects BEN-DC to HAY-DC regardless of what bus0/bus1 say in
-    the CSV, correcting for the historical BEN/HAY AC bus naming error.
-
-    Efficiency is read from the CSV if present; otherwise derived from a
-    standard 0.011 Ohm/km DC cable resistance at rated conditions, giving
-    approximately 0.965 for the 552 km Cook Strait cable.
-
-    Parameters
-    ----------
-    network : pypsa.Network
-    df_links : pd.DataFrame
-    island : str or None
-
-    Returns
-    -------
-    pypsa.Network
+    Replaces the previous three-segment chain (BEN-DC->FTB->OTB->HAY-DC)
+    with a single bidirectional Link between Benmore AC (BEN, 220 kV) and
+    Haywards AC (HAY_220, 220 kV). DC intermediate buses are not added.
+    No carrier is set to avoid DC sub-network topology issues in the LP solver.
     """
     if island is not None:
         log.info("\n  HVDC links: skipped (single-island build)")
         return network
 
-    log.info("\n  Adding HVDC links")
+    log.info("\n  Adding HVDC Cook Strait link (single BEN->HAY_220)")
 
-    # Bus names are used directly from links_data.csv.
-    # The CSV uses the correct DC bus names throughout:
-    #   BEN-DC, FTB, OTB, HAY-DC
-    # No remapping is required.
+    HVDC_BUS0       = "BEN"
+    HVDC_BUS1       = "HAY_220"
+    HVDC_P_NOM      = 1200.0
+    HVDC_EFFICIENCY = 0.965
 
-    added = 0
-    for _, row in df_links.iterrows():
-        link_name = row["link"]
-        bus0      = str(row["bus0"]).strip()
-        bus1      = str(row["bus1"]).strip()
-        length_km = row["length"]
+    if HVDC_BUS0 not in network.buses.index:
+        log.warning("  HVDC skipped: bus %s not in network", HVDC_BUS0)
+        return network
+    if HVDC_BUS1 not in network.buses.index:
+        log.warning("  HVDC skipped: bus %s not in network", HVDC_BUS1)
+        return network
 
-        if bus0 not in network.buses.index:
-            log.warning("    Link %s: bus0 '%s' not in network -- skipped",
-                        link_name, bus0)
-            continue
-        if bus1 not in network.buses.index:
-            log.warning("    Link %s: bus1 '%s' not in network -- skipped",
-                        link_name, bus1)
-            continue
+    network.add(
+        "Link",
+        "HVDC_BEN_HAY",
+        bus0=HVDC_BUS0,
+        bus1=HVDC_BUS1,
+        p_nom=HVDC_P_NOM,
+        p_min_pu=-1.0,
+        p_max_pu=1.0,
+        efficiency=HVDC_EFFICIENCY,
+    )
 
-        # Efficiency: use CSV value if available, otherwise derive from length
-        if "efficiency" in df_links.columns and pd.notna(row.get("efficiency")):
-            efficiency = float(row["efficiency"])
-        else:
-            # Standard DC cable: 0.011 Ohm/km, ~3.5% losses at 552 km
-            r_total   = 0.011 * float(length_km)
-            efficiency = round(1.0 - (r_total / 600.0), 4)   # approximate
-            log.info("    %s: efficiency derived from cable resistance: %.4f",
-                     link_name, efficiency)
-
-        # p_nom from CSV or default to 1200 MW (Cook Strait rated capacity)
-        p_nom = 1200.0
-
-        network.add(
-            "Link",
-            link_name,
-            bus0=bus0,
-            bus1=bus1,
-            length=float(length_km),
-            carrier="DC",
-            p_max_pu=1.0,
-            p_min_pu=-1.0,
-            p_nom=p_nom,
-            efficiency=efficiency,
-            marginal_cost=0.0,
-            capital_cost=0.0,
-            p_nom_extendable=False,
-            build_year=int(row.get("build_year", 1980)),
-        )
-        log.info("    Added: %s  %s -> %s  %.0f MW  eta=%.4f",
-                 link_name, bus0, bus1, p_nom, efficiency)
-        added += 1
-
-    log.info("    Added %d HVDC links", added)
+    log.info("  Added HVDC_BEN_HAY: %s -> %s  p_nom=%.0f MW  eta=%.4f",
+             HVDC_BUS0, HVDC_BUS1, HVDC_P_NOM, HVDC_EFFICIENCY)
     return network
 
 
@@ -1331,10 +1283,25 @@ def main():
         for month_num in range(1, 13):
             try:
                 # Determine which island(s) to build.
-                # If lines_data_si.csv exists but lines_data.csv does not,
-                # build SI only.  Full-country build requires lines_data.csv.
-                if paths["lines"].exists():
-                    islands_to_build = [None]   # full country
+                # Determine which networks to build.
+                # If both SI and NI lines files exist, auto-generate the
+                # combined lines_data.csv as their union, then build all three.
+                # The combined file is always regenerated to stay in sync.
+                both_exist = (paths["lines_si"].exists() and
+                              paths["lines_ni"].exists())
+                if both_exist:
+                    import pandas as _pd
+                    df_si = _pd.read_csv(str(paths["lines_si"]), dtype=str)
+                    df_ni = _pd.read_csv(str(paths["lines_ni"]), dtype=str)
+                    df_combined = _pd.concat([df_si, df_ni],
+                                             ignore_index=True)
+                    df_combined.to_csv(str(paths["lines"]), index=False)
+                    log.info("  Auto-generated combined lines_data.csv "
+                             "(%d SI + %d NI = %d total lines)",
+                             len(df_si), len(df_ni), len(df_combined))
+                    islands_to_build = ["SI", "NI", None]
+                elif paths["lines"].exists():
+                    islands_to_build = [None]   # full country only
                 else:
                     islands_to_build = []
                     if paths["lines_si"].exists():

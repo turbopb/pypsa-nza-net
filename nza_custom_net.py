@@ -194,13 +194,15 @@ def set_dispatchable_availability(
     network: pypsa.Network,
     generator_list: List[str],
     availability: Dict[str, float],
+    month_num: int = 0,
+    hydro_seasonal: Dict[int, float] = None,
 ) -> pypsa.Network:
     """
     Set scalar p_max_pu for dispatchable generators.
 
-    Uses the availability map from the YAML config.  Wind and solar are
-    skipped here -- their p_max_pu is set from timeseries profiles in
-    assign_renewable_profiles().
+    Uses the availability map from the YAML config. If hydro_seasonal is
+    provided, hydro p_max_pu varies by month number (1=Jan..12=Dec).
+    Wind and solar are skipped here -- handled by timeseries profiles.
 
     Parameters
     ----------
@@ -209,6 +211,10 @@ def set_dispatchable_availability(
         Active generator names.
     availability : dict
         Carrier -> scalar availability (from config['availability']).
+    month_num : int
+        Month number (1-12). Used for seasonal hydro availability.
+    hydro_seasonal : dict or None
+        {month_num: p_max_pu} seasonal profile for hydro.
 
     Returns
     -------
@@ -226,7 +232,10 @@ def set_dispatchable_availability(
         if carrier in renewable_carriers:
             continue   # handled by timeseries assignment
 
-        if carrier in availability:
+        # Use seasonal hydro profile if available
+        if carrier == "hydro" and hydro_seasonal and month_num in hydro_seasonal:
+            network.generators.at[gen, "p_max_pu"] = float(hydro_seasonal[month_num])
+        elif carrier in availability:
             network.generators.at[gen, "p_max_pu"] = availability[carrier]
         else:
             log.warning("    No availability entry for carrier '%s' (gen %s)",
@@ -627,25 +636,25 @@ def process_monthly_network(
     month_name   = MONTHS[month_num - 1]
     scenario     = config.get("scenario", "reference")
 
-    # Check for island-prefixed network directory (si_jan_2024, ni_jan_2024)
-    # Fall back to unprefixed (jan_2024) for full-country builds
-    base_label   = f"{month_name}_{year}"
-    si_label     = f"si_{base_label}"
-    ni_label     = f"ni_{base_label}"
-    net_base     = paths["networks"] / scenario / str(year)
+    # Process all existing network variants for this month:
+    #   si_jan_2024  -- South Island standalone
+    #   ni_jan_2024  -- North Island standalone
+    #   jan_2024     -- Combined two-island network
+    base_label = f"{month_name}_{year}"
+    net_base   = paths["networks"] / scenario / str(year)
 
-    if (net_base / si_label).exists():
-        network_dir = net_base / si_label
-        month_label = si_label
-    elif (net_base / ni_label).exists():
-        network_dir = net_base / ni_label
-        month_label = ni_label
-    elif (net_base / base_label).exists():
-        network_dir = net_base / base_label
-        month_label = base_label
-    else:
-        network_dir = net_base / base_label   # will trigger error below
-        month_label = base_label
+    variants = []
+    for label in [f"si_{base_label}", f"ni_{base_label}", base_label]:
+        if (net_base / label).exists():
+            variants.append(label)
+
+    if not variants:
+        log.error("  No network folder found for %s/%s", year, base_label)
+        return
+
+    # Process first variant -- rest handled in loop at end of function
+    month_label = variants[0]
+    network_dir = net_base / month_label
 
     log.info("\n%s", "=" * 60)
     log.info("Customising  %s", month_label)
@@ -684,7 +693,17 @@ def process_monthly_network(
 
     # --- Step 2: Set dispatchable availability ---
     log.info("\n  Step 2: Setting dispatchable availability")
-    network = set_dispatchable_availability(network, active_gens, availability)
+    hydro_seasonal = config.get("hydro_seasonal_availability", {})
+    # Convert string keys to int (YAML may load them as strings)
+    hydro_seasonal = {int(k): float(v) for k, v in hydro_seasonal.items()}
+    network = set_dispatchable_availability(
+        network, active_gens, availability,
+        month_num=month_num,
+        hydro_seasonal=hydro_seasonal,
+    )
+    if hydro_seasonal:
+        hydro_pu = hydro_seasonal.get(month_num, availability.get("hydro", 0.75))
+        log.info("    Hydro p_max_pu this month (month %d): %.2f", month_num, hydro_pu)
 
     # --- Step 3: Wind profiles ---
     log.info("\n  Step 3: Assigning wind profiles")
@@ -715,6 +734,8 @@ def process_monthly_network(
 
     if solar_path.exists():
         solar_df = pd.read_csv(solar_path, index_col=0, parse_dates=True)
+        solar_df.index = pd.to_datetime(solar_df.index)
+        solar_df = solar_df[~solar_df.index.duplicated(keep="first")]
         network  = assign_renewable_profiles(network, solar_df, "solar_pv", solar_mapping)
         network  = set_brownfield_expansion_limits(network, "solar_pv", solar_exp_factors)
     else:
@@ -733,6 +754,61 @@ def process_monthly_network(
     log.info("\n  Step 7: Saving")
     network.export_to_csv_folder(str(network_dir))
     log.info("    Saved to %s", network_dir)
+
+    # --- Process remaining variants (ni_, combined) ---
+    for extra_label in variants[1:]:
+        extra_dir = net_base / extra_label
+        log.info("")
+        log.info("=" * 60)
+        log.info("Customising  %s", extra_label)
+        log.info("=" * 60)
+        try:
+            extra_net = pypsa.Network()
+            extra_net.import_from_csv_folder(str(extra_dir))
+            # Restore standard component type libraries
+            _ref = pypsa.Network()
+            extra_net.transformer_types = _ref.transformer_types
+            extra_net.line_types        = _ref.line_types
+            register_custom_transformer_types(extra_net)
+            extra_net.calculate_dependent_values()
+            # Apply same customisation steps
+            extra_active = get_active_generators(
+                extra_net, paths["annual"], year, month_num)
+            extra_net = set_dispatchable_availability(
+                extra_net, extra_active, availability,
+                month_num=month_num, hydro_seasonal=hydro_seasonal)
+            # Wind profiles
+            month_code = f"{year}{month_num:02d}"
+            wind_path  = paths["wind_mon_root"] / str(year) / f"wind_p_pu_{month_code}.csv"
+            if wind_path.exists():
+                wind_df   = pd.read_csv(str(wind_path), index_col=0, parse_dates=True)
+                wind_df.index = pd.to_datetime(wind_df.index)
+                extra_net = assign_renewable_profiles(
+                    extra_net, wind_df, "wind", wind_mapping)
+                extra_net = set_brownfield_expansion_limits(
+                    extra_net, "wind", wind_exp_factors)
+            # Solar profiles
+            solar_year_file  = f"solar_PV_p_pu_{year}.csv"
+            solar_alias_file = config["filename"].get("solar", "solar_PV_p_pu.csv")
+            solar_path = paths["solar"] / solar_year_file
+            if not solar_path.exists():
+                solar_path = paths["solar"] / solar_alias_file
+            if solar_path.exists():
+                solar_df = pd.read_csv(str(solar_path), index_col=0, parse_dates=True)
+                solar_df.index = pd.to_datetime(solar_df.index)
+                # Remove duplicate timestamps if present
+                solar_df = solar_df[~solar_df.index.duplicated(keep="first")]
+                extra_net = assign_renewable_profiles(
+                    extra_net, solar_df, "solar_pv", solar_mapping)
+                extra_net = set_brownfield_expansion_limits(
+                    extra_net, "solar_pv", solar_exp_factors)
+            extra_net = add_greenfield_generators(extra_net, config, year)
+            extra_net = setup_costs(extra_net, paths, config, year)
+            extra_net.export_to_csv_folder(str(extra_dir))
+            log.info("    Saved to %s", extra_dir)
+        except Exception as exc:
+            log.error("    Failed %s: %s", extra_label, exc)
+            import traceback; traceback.print_exc()
 
 
 # =============================================================================
