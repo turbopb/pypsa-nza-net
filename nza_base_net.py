@@ -9,9 +9,10 @@ This script is part of the pypsa-nza-net module.  It reads clean, pre-processed
 input data produced by pypsa-nza-data and constructs a PyPSA network with:
 
     - Buses from nodes.csv (110 kV and above AC; dedicated DC buses)
-    - AC transmission lines from lines_data.csv (110 kV and 220 kV only)
+    - AC transmission lines from lines_data.csv (110 kV and 220 kV only),
+      including optional explicit base-year ratings in ``s_nom_mva``
     - Transformers at multi-voltage substations (auto-detected)
-    - Cook Strait HVDC link from links_data.csv (as PyPSA Link)
+    - One simplified Cook Strait HVDC connection (as a PyPSA Link)
     - Generators from generator_registry.csv (all dormant at p_max_pu=0)
     - Load timeseries from {year}_export_sites_all.csv
 
@@ -21,11 +22,14 @@ North Island, South Island, or full country networks can be built
 independently.  The HVDC link is only added when building the full country
 network (island=None).
 
-Timestep resampling
--------------------
-Source data is 30-minute half-hourly.  A target timestep can be specified
-in the YAML config ('frequency' key, pandas offset string).  Resampling is
-applied to all timeseries before network construction.
+Timestep and unit handling
+--------------------------
+The annual Electricity Authority/Transpower files must declare whether their
+values are interval energy (MWh) or average power (MW).  Interval energy is
+converted to average MW before it is assigned to PyPSA ``p_set``.  Snapshot
+objective, generator and store weightings are the duration of one model
+snapshot in hours.  This keeps both power balance and energy accounting
+dimensionally correct for the native 30-minute data and for coarser models.
 
 Network output
 --------------
@@ -38,6 +42,7 @@ Author: Phillippe Bruneau
 import sys
 import logging
 import calendar
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -91,8 +96,7 @@ def get_dc_node_sites(df_links: pd.DataFrame) -> set:
 # will not be endpoints of AC transmission lines.
 AC_VOLT_THRESHOLD_KV = 110
 
-# PyPSA standard transformer type for 220/110 kV inter-bus transformers.
-# s_nom is set extendable with capital_cost=0 as placeholder.
+# Transformer type for fixed 220/110 kV inter-bus transformers.
 TRANSFORMER_TYPE = "630MVA 220/110kV"
 
 # Custom transformer types not in the PyPSA standard library.
@@ -169,6 +173,52 @@ def load_config(config_path: Path) -> Dict:
         raise FileNotFoundError(f"Config file not found: {config_path}")
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
+
+
+def fixed_interval_hours(frequency: str) -> float:
+    """Return the duration in hours of a fixed pandas frequency."""
+    try:
+        offset = pd.tseries.frequencies.to_offset(frequency)
+        hours = offset.nanos / 3_600_000_000_000
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Frequency {frequency!r} is not a fixed-duration interval"
+        ) from exc
+    if not math.isfinite(hours) or hours <= 0:
+        raise ValueError(f"Frequency {frequency!r} has invalid duration")
+    return float(hours)
+
+
+def annual_timeseries_contract(config: Dict) -> Dict[str, str]:
+    """Validate the explicit source quantity/unit/frequency declaration."""
+    contract = config.get("annual_timeseries")
+    if not isinstance(contract, dict):
+        raise ValueError(
+            "Config must define annual_timeseries with input_quantity, "
+            "input_unit and source_interval"
+        )
+
+    quantity = str(contract.get("input_quantity", "")).strip().lower()
+    unit = str(contract.get("input_unit", "")).strip()
+    source_interval = str(contract.get("source_interval", "")).strip()
+    valid_pairs = {
+        ("interval_energy", "MWh"),
+        ("average_power", "MW"),
+    }
+    if (quantity, unit) not in valid_pairs:
+        raise ValueError(
+            "annual_timeseries must declare either "
+            "input_quantity=interval_energy with input_unit=MWh, or "
+            "input_quantity=average_power with input_unit=MW"
+        )
+    if not source_interval:
+        raise ValueError("annual_timeseries.source_interval is required")
+    fixed_interval_hours(source_interval)
+    return {
+        "input_quantity": quantity,
+        "input_unit": unit,
+        "source_interval": source_interval,
+    }
 
 
 def resolve_paths(config: Dict) -> Dict:
@@ -374,13 +424,16 @@ def load_annual_timeseries(
     year: int,
     freq_source: str = "30min",
     freq_target: str = "30min",
+    input_quantity: str = "interval_energy",
+    input_unit: str = "MWh",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Load annual export (load) and import (generation) timeseries.
 
-    Resamples from source frequency to target frequency if they differ.
-    Export values are energy in MWh per half-hour; import likewise.
-    When resampling to a coarser resolution, sum (energy) is used.
+    Resamples from source frequency to target frequency if they differ, then
+    returns average power in MW. For interval-energy input, source MWh are
+    summed into the target interval and divided by target hours. For
+    average-power input, MW values are averaged into the target interval.
 
     Parameters
     ----------
@@ -391,11 +444,15 @@ def load_annual_timeseries(
         Native data frequency (default '30min').
     freq_target : str
         Target frequency for the network (e.g. '30min', '1h', '1D').
+    input_quantity : str
+        ``interval_energy`` or ``average_power``.
+    input_unit : str
+        ``MWh`` for interval energy or ``MW`` for average power.
 
     Returns
     -------
     (df_export, df_import) : tuple of pd.DataFrame
-        Both indexed by datetime, columns are site codes.
+        Both indexed by datetime, columns are site codes, values are MW.
     """
     export_path = annual_dir / f"{year}_export_sites_all.csv"
     import_path = annual_dir / f"{year}_import_sites_all.csv"
@@ -407,13 +464,72 @@ def load_annual_timeseries(
     df_export = pd.read_csv(export_path, index_col=0, parse_dates=True)
     df_import = pd.read_csv(import_path, index_col=0, parse_dates=True)
 
+    quantity = str(input_quantity).strip().lower()
+    unit = str(input_unit).strip()
+    valid_pairs = {
+        ("interval_energy", "MWh"),
+        ("average_power", "MW"),
+    }
+    if (quantity, unit) not in valid_pairs:
+        raise ValueError(
+            f"Unsupported annual timeseries declaration: {quantity!r}, {unit!r}"
+        )
+
+    source_hours = fixed_interval_hours(freq_source)
+    target_hours = fixed_interval_hours(freq_target)
+    if target_hours < source_hours:
+        raise ValueError(
+            f"Upsampling annual data is not supported: {freq_source} -> {freq_target}"
+        )
+    ratio = target_hours / source_hours
+    if not math.isclose(ratio, round(ratio), rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(
+            f"Target interval {freq_target} is not an integer multiple of "
+            f"source interval {freq_source}"
+        )
+
+    for label, dataframe in (("Export", df_export), ("Import", df_import)):
+        dataframe.index = pd.DatetimeIndex(
+            pd.to_datetime(dataframe.index, errors="raise")
+        )
+        if dataframe.index.has_duplicates:
+            raise ValueError(f"{label} timeseries contains duplicate timestamps")
+        if not dataframe.index.is_monotonic_increasing:
+            raise ValueError(f"{label} timeseries timestamps are not ordered")
+        dataframe.columns = [str(column).strip().upper() for column in dataframe.columns]
+        if pd.Index(dataframe.columns).duplicated().any():
+            raise ValueError(f"{label} timeseries contains duplicate site columns")
+        converted = dataframe.apply(pd.to_numeric, errors="raise")
+        if converted.isna().any().any():
+            raise ValueError(f"{label} timeseries contains missing values")
+        if (converted < 0).any().any():
+            raise ValueError(f"{label} timeseries contains negative values")
+        if label == "Export":
+            df_export = converted
+        else:
+            df_import = converted
+
     log.info("  Export: %d timesteps x %d sites", len(df_export), len(df_export.columns))
     log.info("  Import: %d timesteps x %d sites", len(df_import), len(df_import.columns))
 
+    if quantity == "interval_energy":
+        if freq_target != freq_source:
+            log.info("  Resampling %s -> %s (sum for interval energy)", freq_source, freq_target)
+            df_export = df_export.resample(freq_target).sum()
+            df_import = df_import.resample(freq_target).sum()
+        df_export = df_export / target_hours
+        df_import = df_import / target_hours
+        log.info(
+            "  Converted interval energy (%s) to average power (MW) using %.6g h",
+            unit,
+            target_hours,
+        )
+    elif freq_target != freq_source:
+        log.info("  Resampling %s -> %s (mean for average power)", freq_source, freq_target)
+        df_export = df_export.resample(freq_target).mean()
+        df_import = df_import.resample(freq_target).mean()
+
     if freq_target != freq_source:
-        log.info("  Resampling %s -> %s (sum for energy)", freq_source, freq_target)
-        df_export = df_export.resample(freq_target).sum()
-        df_import = df_import.resample(freq_target).sum()
         log.info("  After resample: %d timesteps", len(df_export))
 
     return df_export, df_import
@@ -634,6 +750,7 @@ def add_lines(
     network: pypsa.Network,
     df_lines: pd.DataFrame,
     multi_volt_sites: Dict,
+    config: Optional[Dict] = None,
 ) -> pypsa.Network:
     """
     Add AC transmission lines to the network.
@@ -643,13 +760,20 @@ def add_lines(
     column from lines_data.csv is used as the circuit length in km.
 
     Double-circuit lines (config == 'double') are represented with
-    num_parallel=2.
+    num_parallel=2. If a source row contains a non-blank ``s_nom_mva`` value,
+    that explicit source-data rating is used instead of the generic rating
+    inferred from the standard line type. These are base-network data
+    corrections for assets already represented in the reference network;
+    they are not future transmission investments.
 
     Parameters
     ----------
     network : pypsa.Network
     df_lines : pd.DataFrame
     multi_volt_sites : dict
+    config : dict, optional
+        Retained for call-site compatibility. Line ratings are read from the
+        authoritative transmission source table rather than configuration.
 
     Returns
     -------
@@ -692,6 +816,57 @@ def add_lines(
         line_type   = LINE_TYPE_MAP.get(volts, default_type)
         num_parallel = 2 if str(row.get("config", "")).lower() == "double" else 1
 
+        # A PyPSA line type supplies impedance and current-rating data, but it
+        # does not set the Line component's optimisation capacity.  Fixed
+        # lines therefore require an explicit s_nom; otherwise the Line
+        # default of zero MVA prevents all power transfer in n.optimize().
+        if line_type not in network.line_types.index:
+            raise KeyError(
+                f"Line {line_name}: unknown PyPSA line type {line_type!r}"
+            )
+
+        i_nom_ka = float(network.line_types.at[line_type, "i_nom"])
+        if not math.isfinite(i_nom_ka) or i_nom_ka <= 0.0:
+            raise ValueError(
+                f"Line {line_name}: line type {line_type!r} has invalid "
+                f"i_nom={i_nom_ka!r} kA"
+            )
+
+        # kV * kA gives MVA for the balanced three-phase rating.
+        generic_s_nom_mva = (
+            math.sqrt(3.0)
+            * float(volts)
+            * i_nom_ka
+            * float(num_parallel)
+        )
+        explicit_rating_raw = row.get("s_nom_mva", "")
+        explicit_rating_text = (
+            "" if pd.isna(explicit_rating_raw)
+            else str(explicit_rating_raw).strip()
+        )
+        if explicit_rating_text:
+            try:
+                s_nom_mva = float(explicit_rating_text)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Line {line_name}: s_nom_mva {explicit_rating_raw!r} "
+                    "is not numeric"
+                ) from exc
+            if not math.isfinite(s_nom_mva) or s_nom_mva <= 0.0:
+                raise ValueError(
+                    f"Line {line_name}: s_nom_mva must be finite and positive, "
+                    f"got {s_nom_mva!r}"
+                )
+            log.info(
+                "    Line %s: explicit source-data rating "
+                "%.6f MVA (generic proxy %.6f MVA)",
+                line_name,
+                s_nom_mva,
+                generic_s_nom_mva,
+            )
+        else:
+            s_nom_mva = generic_s_nom_mva
+
         network.add(
             "Line",
             line_name,
@@ -701,6 +876,7 @@ def add_lines(
             type=line_type,
             num_parallel=num_parallel,
             carrier="AC",
+            s_nom=s_nom_mva,
             s_nom_extendable=False,
         )
         added += 1
@@ -761,8 +937,8 @@ def add_transformers(
             bus0=bus_high,
             bus1=bus_low,
             type=trafo_type,
-            s_nom_extendable=True,
-            capital_cost=0.0,   # placeholder: update in YAML cost file
+            s_nom_extendable=False,
+            capital_cost=0.0,
         )
         log.info("    %s: %s kV <-> %s kV  [%s]", trafo_name, v_high, v_low, trafo_type)
         added += 1
@@ -818,10 +994,72 @@ def add_hvdc_links(
     return network
 
 
+def prepare_model_generators(
+    df_gen: pd.DataFrame,
+    multi_volt_sites: Dict,
+) -> pd.DataFrame:
+    """Convert the global generator registry into the model inventory.
+
+    Huntly is deliberately represented as one simplified gas generator. The
+    registry's three HLY records are therefore aggregated by capacity rather
+    than added as separate technology-specific units. Its mixed commissioning
+    history is represented by build_year=0 so retirement remains a TEFF
+    planner decision instead of being inferred from a false single vintage.
+    """
+    model_gen = df_gen.copy()
+    model_gen["site"] = model_gen["site"].astype(str).str.strip().str.upper()
+
+    hly_mask = model_gen["site"].eq("HLY")
+    if not hly_mask.any():
+        raise ValueError("Global generator registry contains no HLY entries")
+
+    hly_rows = model_gen.loc[hly_mask]
+    hly = hly_rows.iloc[0].copy()
+    hly["plant_name"] = "Huntly Power Station (lumped)"
+    hly["site"] = "HLY"
+    hly["volts_kv"] = 220
+    hly["bus"] = "HLY"
+    hly["carrier"] = "gas"
+    hly["p_nom_mw"] = float(hly_rows["p_nom_mw"].sum())
+    hly["build_year"] = 0
+    if "peaking" in hly.index:
+        hly["peaking"] = "N"
+
+    model_gen = pd.concat(
+        [model_gen.loc[~hly_mask], pd.DataFrame([hly])],
+        ignore_index=True,
+    )
+
+    def _resolve_generator_bus(row: pd.Series) -> str:
+        site = str(row["site"]).strip()
+        volts = None if pd.isna(row["volts_kv"]) else int(row["volts_kv"])
+        return resolve_bus_name(site, volts, multi_volt_sites)
+
+    model_gen["_resolved_bus"] = model_gen.apply(
+        _resolve_generator_bus, axis=1
+    )
+    model_gen["_generator_name"] = (
+        model_gen["_resolved_bus"].astype(str)
+        + "_"
+        + model_gen["carrier"].astype(str)
+    )
+
+    log.info(
+        "  Generator model inventory: %d registry rows -> %d model generators; "
+        "HLY lumped capacity %.1f MW",
+        len(df_gen),
+        len(model_gen),
+        float(hly["p_nom_mw"]),
+    )
+    return model_gen
+
+
 def add_generators(
     network: pypsa.Network,
     df_gen: pd.DataFrame,
+    df_lines: pd.DataFrame,
     multi_volt_sites: Dict,
+    island: Optional[str] = None,
 ) -> pypsa.Network:
     """
     Add generators to the network from the generator registry.
@@ -833,7 +1071,9 @@ def add_generators(
     ----------
     network : pypsa.Network
     df_gen : pd.DataFrame
-        Generator registry from build_generator_registry.py.
+        Global generator registry from build_generator_registry.py.
+    df_lines : pd.DataFrame
+        AC transmission lines used to construct this network.
     multi_volt_sites : dict
 
     Returns
@@ -842,12 +1082,68 @@ def add_generators(
     """
     log.info("\n  Adding generators (all dormant)")
 
-    # Pre-filter to generators whose bus exists in this network.
+    model_gen = prepare_model_generators(df_gen, multi_volt_sites)
+
+    # Resolve the source line endpoints exactly as add_lines() does. This
+    # provides an explicit source-data connectivity check for each generator.
+    connected_line_buses = set()
+    for _, line in df_lines.iterrows():
+        volts = int(line["volts"])
+        for endpoint in ("bus0", "bus1"):
+            connected_line_buses.add(
+                resolve_bus_name(
+                    str(line[endpoint]).strip(), volts, multi_volt_sites
+                )
+            )
+
+    # Pre-filter to generators whose resolved bus exists in this network.
     # When building a single-island network, NI generators are silently
     # excluded rather than generating a warning per skipped generator.
     network_buses = set(network.buses.index)
-    df_gen_filtered = df_gen[df_gen["bus"].isin(network_buses)].copy()
-    n_excluded = len(df_gen) - len(df_gen_filtered)
+    df_gen_filtered = model_gen[
+        model_gen["_resolved_bus"].isin(network_buses)
+    ].copy()
+    n_excluded = len(model_gen) - len(df_gen_filtered)
+
+    duplicate_names = df_gen_filtered.loc[
+        df_gen_filtered["_generator_name"].duplicated(keep=False),
+        "_generator_name",
+    ].unique()
+    if len(duplicate_names):
+        raise ValueError(
+            "Duplicate generator names in the selected network: "
+            + ", ".join(str(name) for name in duplicate_names)
+        )
+
+    # A combined NZ network must contain every registered generator. Missing
+    # entries indicate a real registry-to-topology propagation error.
+    if island is None and n_excluded:
+        missing = model_gen.loc[
+            ~model_gen["_resolved_bus"].isin(network_buses),
+            ["plant_name", "site", "volts_kv", "_resolved_bus"],
+        ]
+        details = "; ".join(
+            f"{row['plant_name']} -> {row['_resolved_bus']}"
+            for _, row in missing.iterrows()
+        )
+        raise ValueError(
+            "Combined network is missing generator buses: " + details
+        )
+
+    unconnected = df_gen_filtered.loc[
+        ~df_gen_filtered["_resolved_bus"].isin(connected_line_buses),
+        ["plant_name", "_resolved_bus"],
+    ]
+    if not unconnected.empty:
+        details = "; ".join(
+            f"{row['plant_name']} -> {row['_resolved_bus']}"
+            for _, row in unconnected.iterrows()
+        )
+        raise ValueError(
+            "Generator buses are not connected in the source line data: "
+            + details
+        )
+
     if n_excluded > 0:
         log.info("    Excluded %d generators not in this island network", n_excluded)
 
@@ -855,7 +1151,7 @@ def add_generators(
     skipped = 0
 
     for _, row in df_gen_filtered.iterrows():
-        bus_name = row["bus"]   # already resolved in generator_registry.csv
+        bus_name = row["_resolved_bus"]
 
         if bus_name not in network.buses.index:
             log.warning("    Generator at bus '%s' not in network -- skipped", bus_name)
@@ -863,7 +1159,7 @@ def add_generators(
             continue
 
         carrier    = row["carrier"]
-        gen_name   = f"{bus_name}_{carrier}"
+        gen_name   = row["_generator_name"]
         p_nom      = float(row["p_nom_mw"])
         build_year = int(row["build_year"])
 
@@ -977,8 +1273,11 @@ def add_loads(
     # Align export data to snapshots
     df_slice = df_export_island.reindex(snapshots).fillna(0.0)
 
-    # Accumulate load per target bus
-    bus_load = {}   # bus -> pd.Series
+    # Accumulate monthly and full-year load per target bus. The annual series
+    # distinguishes a genuinely inactive load location from an active location
+    # that happens to have zero demand in the current month.
+    bus_load = {}          # bus -> monthly pd.Series
+    annual_bus_load = {}   # bus -> annual pd.Series
     agg_count   = 0
     direct_count = 0
     skip_count  = 0
@@ -1003,21 +1302,33 @@ def add_loads(
             skip_count += 1
             continue
 
+        annual_series = df_export_island[site].fillna(0.0)
+
         if target not in bus_load:
             bus_load[target] = df_slice[site].copy()
+            annual_bus_load[target] = annual_series.copy()
         else:
             bus_load[target] = bus_load[target] + df_slice[site]
+            annual_bus_load[target] = annual_bus_load[target] + annual_series
 
         if target == site_up:
             direct_count += 1
         else:
             agg_count += 1
 
-    # Add aggregated loads to network
+    # Add aggregated loads to network. Exclude locations that are inactive for
+    # the whole source year, but retain annually active locations when their
+    # current-month series is zero. This keeps monthly component topology
+    # stable without creating permanently inactive load components.
     added = 0
+    zero_series = 0
+    annual_zero = 0
     for bus, p_series in bus_load.items():
+        if annual_bus_load[bus].abs().max() < 0.001:
+            annual_zero += 1
+            continue
         if p_series.abs().max() < 0.001:
-            continue  # skip negligible loads
+            zero_series += 1
         load_name = bus
         if load_name not in network.loads.index:
             network.add("Load", load_name, bus=bus, p_set=0.0)
@@ -1034,6 +1345,10 @@ def add_loads(
     log.info("    Direct loads: %d  Aggregated: %d  Skipped: %d  "
              "Total buses with load: %d",
              direct_count, agg_count, skip_count, added)
+    if annual_zero:
+        log.info("    Excluded annual-zero load locations: %d", annual_zero)
+    if zero_series:
+        log.info("    Retained zero-series load components: %d", zero_series)
     log.info("    Total mean load: %.1f MW",
              sum(s.mean() for s in bus_load.values()))
     return network
@@ -1056,14 +1371,16 @@ def make_snapshots(year: int, month: Optional[int], freq: str) -> pd.DatetimeInd
     pd.DatetimeIndex
     """
     if month is None:
-        start = f"{year}-01-01 00:00"
-        end   = f"{year}-12-31 23:30"
+        start = pd.Timestamp(year=year, month=1, day=1)
+        end = pd.Timestamp(year=year + 1, month=1, day=1)
     else:
-        last_day = calendar.monthrange(year, month)[1]
-        start = f"{year}-{month:02d}-01 00:00"
-        end   = f"{year}-{month:02d}-{last_day:02d} 23:30"
+        start = pd.Timestamp(year=year, month=month, day=1)
+        if month == 12:
+            end = pd.Timestamp(year=year + 1, month=1, day=1)
+        else:
+            end = pd.Timestamp(year=year, month=month + 1, day=1)
 
-    return pd.date_range(start=start, end=end, freq=freq)
+    return pd.date_range(start=start, end=end, freq=freq, inclusive="left")
 
 
 # =============================================================================
@@ -1104,6 +1421,8 @@ def build_base_network(
     log.info("%s", "=" * 60)
 
     freq = config.get("frequency", "30min")
+    snapshot_hours = fixed_interval_hours(freq)
+    timeseries_contract = annual_timeseries_contract(config)
 
     # ------------------------------------------------------------------
     # Load static data
@@ -1142,8 +1461,10 @@ def build_base_network(
     log.info("\nLoading timeseries data")
     df_export, df_import = load_annual_timeseries(
         paths["annual"], year,
-        freq_source="30min",
+        freq_source=timeseries_contract["source_interval"],
         freq_target=freq,
+        input_quantity=timeseries_contract["input_quantity"],
+        input_unit=timeseries_contract["input_unit"],
     )
 
     # ------------------------------------------------------------------
@@ -1159,13 +1480,22 @@ def build_base_network(
     # ------------------------------------------------------------------
     network = pypsa.Network()
     network.set_snapshots(snapshots)
+    network.snapshot_weightings.loc[:, ["objective", "stores", "generators"]] = (
+        snapshot_hours
+    )
 
     network = add_carriers(network)
     network = add_buses(network, df_nodes, df_lines, multi_volt_sites, dc_sites, island)
-    network = add_lines(network, df_lines, multi_volt_sites)
+    network = add_lines(network, df_lines, multi_volt_sites, config=config)
     network = add_transformers(network, multi_volt_sites, df_nodes)
     network = add_hvdc_links(network, df_links, island)
-    network = add_generators(network, df_gen, multi_volt_sites)
+    network = add_generators(
+        network,
+        df_gen,
+        df_lines,
+        multi_volt_sites,
+        island=island,
+    )
     network = add_loads(network, df_export, snapshots, df_nodes, config=config, island=island)
 
     # ------------------------------------------------------------------
@@ -1222,10 +1552,9 @@ def save_network(
     folder = paths["networks"] / scenario / str(year) / f"{prefix}{period}"
     folder.mkdir(parents=True, exist_ok=True)
 
-    # Calculate dependent values before saving so that all derived
-    # electrical parameters (x, r, b, s_nom) are written to CSV.
-    # Without this, only the line type name is stored and parameters
-    # must be recomputed every time the network is loaded.
+    # Calculate type-dependent impedance values before saving. Line s_nom is
+    # assigned explicitly during construction because it is an optimisation
+    # input, not a value derived from the line type by this method.
     network.calculate_dependent_values()
     network.export_to_csv_folder(str(folder))
 
@@ -1248,72 +1577,154 @@ def save_network(
 
 def main():
     """
-    Build base networks for all configured years and months.
+    Build the three base-network representations for all configured
+    years and months:
 
-    Reads configuration from the default YAML path.  Builds monthly networks
-    for the base year and any future years defined in the config.
+        SI   - South Island only
+        NI   - North Island only
+        NZ   - Combined North + South Island network, including HVDC
+
+    The transmission source files are:
+
+        lines_data_si.csv -> South Island network
+        lines_data_ni.csv -> North Island network
+        lines_data.csv    -> Combined NZ network
+
+    These source files are treated as independent authoritative datasets.
+    nza_base_net.py does not create or overwrite them.
     """
-    # Locate workspace and config
-    # Locate workspace via nza_root (reads PYPSA_NZA_ROOT env var).
-    # nza_root.py must sit in the project root directory alongside all
-    # module repos.  See SETUP.md for setup instructions.
-    _root_str = __import__('os').environ.get('PYPSA_NZA_ROOT', '')
-    if _root_str:
-        sys.path.insert(0, str(Path(_root_str).resolve()))
+
+    # ------------------------------------------------------------------
+    # Locate workspace
+    # ------------------------------------------------------------------
+    analysis_root = Path(__file__).resolve().parents[1]
+    misc_dir = analysis_root / "misc"
+    nza_root_file = misc_dir / "nza_root.py"
+
+    if not nza_root_file.exists():
+        raise FileNotFoundError(
+            f"Cannot locate nza_root.py: {nza_root_file}"
+        )
+
+    misc_dir_str = str(misc_dir)
+
+    if misc_dir_str not in sys.path:
+        sys.path.insert(0, misc_dir_str)
+
     from nza_root import WORKSPACE
+
     config_path = WORKSPACE / "config" / "nza_net_config.yaml"
 
-    log.info("Config: %s", config_path)
+    log.info("Workspace: %s", WORKSPACE)
+    log.info("Config   : %s", config_path)
+
+    # ------------------------------------------------------------------
+    # Load configuration
+    # ------------------------------------------------------------------
     config = load_config(config_path)
-    paths  = resolve_paths(config)
+    paths = resolve_paths(config)
 
-    scenario  = config.get("scenario", "reference")
-    base_year = config.get("base_year", 2024)
-    freq      = config.get("frequency", "30min")
+    scenario = config.get("scenario", "reference")
+    frequency = config.get("frequency", "30min")
 
-    start_year = config["scenario_years"]["start"]
-    end_year   = config["scenario_years"]["end"]
-    years      = list(range(start_year, end_year + 1))
+    start_year = int(config["scenario_years"]["start"])
+    end_year = int(config["scenario_years"]["end"])
+    years = list(range(start_year, end_year + 1))
 
     log.info("Scenario : %s", scenario)
     log.info("Years    : %s", years)
-    log.info("Frequency: %s", freq)
+    log.info("Frequency: %s", frequency)
+
+    # ------------------------------------------------------------------
+    # Verify all three transmission datasets exist
+    # ------------------------------------------------------------------
+    required_line_files = {
+        "South Island": paths["lines_si"],
+        "North Island": paths["lines_ni"],
+        "Combined NZ": paths["lines"],
+    }
+
+    missing_files = [
+        f"{name}: {path}"
+        for name, path in required_line_files.items()
+        if not path.exists()
+    ]
+
+    if missing_files:
+        raise FileNotFoundError(
+            "Required transmission dataset(s) missing:\n  "
+            + "\n  ".join(missing_files)
+        )
+
+    log.info("Transmission datasets:")
+    log.info("  SI       : %s", paths["lines_si"])
+    log.info("  NI       : %s", paths["lines_ni"])
+    log.info("  Combined : %s", paths["lines"])
+
+    # ------------------------------------------------------------------
+    # Validate line identifiers in each source dataset
+    # ------------------------------------------------------------------
+    for label, path in required_line_files.items():
+        df = pd.read_csv(path, dtype=str)
+
+        if "line" not in df.columns:
+            raise ValueError(
+                f"{label} transmission file has no 'line' column: {path}"
+            )
+
+        line_ids = df["line"].fillna("").str.strip()
+
+        blank_ids = line_ids.eq("")
+
+        if blank_ids.any():
+            csv_rows = list(df.index[blank_ids] + 2)
+
+            raise ValueError(
+                f"{label} transmission file contains blank line "
+                f"identifiers at CSV rows: {csv_rows}"
+            )
+
+        duplicate_ids = line_ids[line_ids.duplicated()].unique()
+
+        if len(duplicate_ids):
+            raise ValueError(
+                f"{label} transmission file contains duplicate line "
+                f"identifiers: {list(duplicate_ids)}"
+            )
+
+        log.info(
+            "  Validated %-11s: %d transmission lines",
+            label,
+            len(df),
+        )
+
+    # ------------------------------------------------------------------
+    # Build all three network representations
+    #
+    # island="SI" -> lines_data_si.csv
+    # island="NI" -> lines_data_ni.csv
+    # island=None -> lines_data.csv + HVDC link
+    # ------------------------------------------------------------------
+    networks_to_build = [
+        ("SI", "South Island"),
+        ("NI", "North Island"),
+        (None, "Combined NZ"),
+    ]
 
     for year in years:
         for month_num in range(1, 13):
-            try:
-                # Determine which island(s) to build.
-                # Determine which networks to build.
-                # If both SI and NI lines files exist, auto-generate the
-                # combined lines_data.csv as their union, then build all three.
-                # The combined file is always regenerated to stay in sync.
-                both_exist = (paths["lines_si"].exists() and
-                              paths["lines_ni"].exists())
-                if both_exist:
-                    import pandas as _pd
-                    df_si = _pd.read_csv(str(paths["lines_si"]), dtype=str)
-                    df_ni = _pd.read_csv(str(paths["lines_ni"]), dtype=str)
-                    df_combined = _pd.concat([df_si, df_ni],
-                                             ignore_index=True)
-                    df_combined.to_csv(str(paths["lines"]), index=False)
-                    log.info("  Auto-generated combined lines_data.csv "
-                             "(%d SI + %d NI = %d total lines)",
-                             len(df_si), len(df_ni), len(df_combined))
-                    islands_to_build = ["SI", "NI", None]
-                elif paths["lines"].exists():
-                    islands_to_build = [None]   # full country only
-                else:
-                    islands_to_build = []
-                    if paths["lines_si"].exists():
-                        islands_to_build.append("SI")
-                    if paths["lines_ni"].exists():
-                        islands_to_build.append("NI")
-                    if not islands_to_build:
-                        log.error("No lines file found. Expected one of: "
-                                  "lines_data.csv, lines_data_si.csv, lines_data_ni.csv")
-                        continue
 
-                for island in islands_to_build:
+            for island, label in networks_to_build:
+
+                log.info(
+                    "Building %s %d/%02d [%s]",
+                    scenario,
+                    year,
+                    month_num,
+                    label,
+                )
+
+                try:
                     network = build_base_network(
                         config=config,
                         paths=paths,
@@ -1321,13 +1732,34 @@ def main():
                         month=month_num,
                         island=island,
                     )
-                    save_network(network, paths, scenario, year, month_num, island)
-            except Exception as exc:
-                log.error("Error building %s %d/%d: %s",
-                          scenario, year, month_num, exc)
-                continue
 
-    log.info("\nDone.  Run nza_custom_net.py to add profiles and costs.")
+                    save_network(
+                        network=network,
+                        paths=paths,
+                        scenario=scenario,
+                        year=year,
+                        month=month_num,
+                        island=island,
+                    )
+
+                except Exception:
+                    log.exception(
+                        "Failed building %s %d/%02d [%s]",
+                        scenario,
+                        year,
+                        month_num,
+                        label,
+                    )
+
+                    # Do not silently continue and leave an apparently
+                    # complete but partially failed network dataset.
+                    raise
+
+    log.info("=" * 60)
+    log.info("Base-network build complete.")
+    log.info("Built SI, NI and combined NZ networks.")
+    log.info("Next: run nza_custom_net.py to add profiles and costs.")
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":

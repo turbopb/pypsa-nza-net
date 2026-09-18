@@ -3,29 +3,36 @@
 """
 nza_custom_net.py
 
-Customise PyPSA networks for capacity expansion analysis.
+Customise validated PyPSA base networks into operational references.
 
-Reads base networks produced by nza_base_net.py and adds:
+Reads SI, NI and combined base networks produced by nza_base_net.py and adds:
     - Generator availability (p_max_pu): scalar for dispatchable plant,
       timeseries for wind and solar.
-    - Brownfield expansion limits for existing renewable sites.
-    - Greenfield generation options (new candidate sites).
-    - Technology costs (annualised capital and marginal).
+    - Operating cost data for existing generators.
+
+This script prepares operational 2024/2025 reference networks only. It does
+not enable brownfield expansion or add greenfield investment candidates;
+future candidate investments are introduced by TEFF stage preparation.
+
+All three monthly network variants are required. Customisation is fail-fast:
+an error stops the run rather than silently leaving a partially customised set.
 
 Workflow
 --------
     nza_base_net.py  -->  base networks (topology + loads, dormant generators)
-    nza_custom_net.py -->  customised networks (ready for optimisation)
+    nza_custom_net.py -->  fixed operational reference networks
+    TEFF preparation  -->  planning-stage candidates and constraints
 
-Output networks are saved back to the same CSV folder, overwriting the base
-network.  Run nza_cx_opt.py next to optimise capacity expansion.
+Validated base networks remain unchanged. Derived operational networks are
+written to ``models/networks/customised/<scenario>/<year>/`` with the same
+SI, NI and combined monthly folder names.
 
 Author: Phillippe Bruneau
 """
 
 import sys
 import logging
-import calendar
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -87,6 +94,11 @@ MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
           "jul", "aug", "sep", "oct", "nov", "dec"]
 
 
+def site_from_bus(bus: str) -> str:
+    """Remove only a trailing voltage suffix from a model bus name."""
+    return re.sub(r"_\d{2,3}$", "", str(bus).strip().upper())
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -99,11 +111,124 @@ def load_config(config_path: Path) -> Dict:
         return yaml.safe_load(f)
 
 
+def validate_renewable_profile_contract(config: Dict) -> None:
+    """Require an explicit dimensionless p.u. contract for wind and solar."""
+    profiles = config.get("renewable_profiles")
+    if not isinstance(profiles, dict):
+        raise ValueError(
+            "Config must define renewable_profiles contracts for wind and solar_pv"
+        )
+
+    model_frequency = str(config.get("frequency", "")).strip()
+    for carrier in ("wind", "solar_pv"):
+        contract = profiles.get(carrier)
+        if not isinstance(contract, dict):
+            raise ValueError(f"renewable_profiles.{carrier} is required")
+        quantity = str(contract.get("quantity", "")).strip()
+        unit = str(contract.get("unit", "")).strip()
+        source_interval = str(contract.get("source_interval", "")).strip()
+        derivation = str(contract.get("derivation", "")).strip()
+        if quantity != "per_unit_availability" or unit != "p.u.":
+            raise ValueError(
+                f"renewable_profiles.{carrier} must declare "
+                "quantity=per_unit_availability and unit=p.u."
+            )
+        if not source_interval or not derivation:
+            raise ValueError(
+                f"renewable_profiles.{carrier} requires source_interval and derivation"
+            )
+        if source_interval != model_frequency:
+            raise ValueError(
+                f"renewable_profiles.{carrier}.source_interval={source_interval!r} "
+                f"does not match model frequency {model_frequency!r}; explicit "
+                "time-averaging is required before coarser profiles may be used"
+            )
+
+
+def _is_nz_dst_end_repeat(timestamp: pd.Timestamp) -> bool:
+    """True for the repeated 02:00/02:30 slots on NZ DST end day."""
+    timestamp = pd.Timestamp(timestamp)
+    return (
+        timestamp.month == 4
+        and timestamp.day <= 7
+        and timestamp.weekday() == 6
+        and timestamp.hour == 2
+        and timestamp.minute in {0, 30}
+    )
+
+
+def _is_nz_dst_start_gap(timestamp: pd.Timestamp) -> bool:
+    """True for the skipped 02:00/02:30 slots on NZ DST start day."""
+    timestamp = pd.Timestamp(timestamp)
+    return (
+        timestamp.month == 9
+        and timestamp.weekday() == 6
+        and (timestamp + pd.Timedelta(days=7)).month != 9
+        and timestamp.hour == 2
+        and timestamp.minute in {0, 30}
+    )
+
+
+def load_profile_csv(
+    path: Path,
+    label: str,
+    normalise_nz_dst: bool = False,
+) -> pd.DataFrame:
+    """Load one renewable profile file and reject ambiguous input.
+
+    Solar profiles are produced in New Zealand civil time, whereas the model
+    uses a fixed 48 timezone-naive snapshots per day. When explicitly enabled,
+    the two repeated autumn PV timestamps are averaged. The corresponding
+    spring gap is handled during network-snapshot alignment.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"{label} profile not found: {path}")
+
+    profile = pd.read_csv(path, index_col=0, parse_dates=True)
+    profile.index = pd.to_datetime(profile.index, errors="raise")
+    if profile.index.has_duplicates:
+        duplicates = profile.index[profile.index.duplicated()].unique()
+        duplicate_counts = profile.index.value_counts().loc[duplicates]
+        valid_dst_repeat = (
+            normalise_nz_dst
+            and all(_is_nz_dst_end_repeat(value) for value in duplicates)
+            and bool(duplicate_counts.eq(2).all())
+        )
+        if not valid_dst_repeat:
+            raise ValueError(
+                f"{label} profile contains duplicate timestamps: "
+                + ", ".join(str(value) for value in duplicates[:10])
+            )
+
+        profile = profile.apply(pd.to_numeric, errors="raise")
+        profile = profile.groupby(level=0, sort=True).mean()
+        log.info(
+            "    %s profile: averaged %d repeated NZ DST timestamps",
+            label,
+            len(duplicates),
+        )
+
+    profile.columns = [str(column).strip().upper() for column in profile.columns]
+    duplicate_columns = sorted(
+        set(profile.columns[profile.columns.duplicated(keep=False)])
+    )
+    if duplicate_columns:
+        raise ValueError(
+            f"{label} profile contains duplicate site columns after "
+            f"normalisation: {duplicate_columns}"
+        )
+    profile = profile.apply(pd.to_numeric, errors="raise")
+    return profile.sort_index()
+
+
 def resolve_paths(config: Dict) -> Dict:
     """Build absolute Path objects for all data inputs and outputs."""
     root = Path(config["paths"]["root"])
     return {
         "networks":    root / config["paths"]["dirpath_networks"],
+        "custom_networks": (
+            root / config["paths"]["dirpath_custom_networks"]
+        ),
         "annual":      root / config["paths"]["dirpath_annual"],
         "static":      root / config["paths"]["dirpath_static"],
         "renewables":  root / config["paths"]["dirpath_renewables"],
@@ -125,64 +250,54 @@ def resolve_paths(config: Dict) -> Dict:
 
 def get_active_generators(
     network: pypsa.Network,
-    import_path: Path,
     year: int,
-    month_num: int,
 ) -> List[str]:
     """
     Return list of generator names active in this network period.
 
-    A generator is considered active if:
-      - It exists in the network, AND
-      - Its site appears as a column with non-zero values in the annual
-        grid import timeseries for the relevant month.
+    The base-network generator inventory defines existing plant. A generator
+    is active when its build year is zero (the explicit unknown/planner-managed
+    sentinel used for lumped Huntly) or no later than the network year.
 
-    This replaces the old approach of reading monthly {YYYYMM}_g_MW.csv
-    files, which no longer exist in the new pipeline.
+    Observed dispatch is deliberately not used as an availability test: a
+    plant that did not generate in one historical month still physically
+    exists and must remain available to the operational model.
 
     Parameters
     ----------
     network : pypsa.Network
-    import_path : Path
-        Directory containing {year}_import_sites_all.csv.
     year : int
-    month_num : int
-        Month number 1-12.
 
     Returns
     -------
     list of str
         Generator names (as stored in network.generators.index).
     """
-    import_file = import_path / f"{year}_import_sites_all.csv"
-    if not import_file.exists():
-        log.warning("Import timeseries not found: %s -- all generators inactive",
-                    import_file)
-        return []
+    if "build_year" not in network.generators.columns:
+        raise ValueError("generators table has no build_year column")
 
-    df = pd.read_csv(import_file, index_col=0, parse_dates=True)
-
-    # Slice to this month
-    df_month = df[df.index.month == month_num]
-
-    # Sites with any non-zero import in this month
-    active_sites = set(
-        col for col in df_month.columns
-        if df_month[col].sum() > 0
+    build_year = pd.to_numeric(
+        network.generators["build_year"], errors="coerce"
     )
+    invalid = network.generators.index[build_year.isna()]
+    if len(invalid):
+        raise ValueError(
+            "Generators have invalid build_year values: "
+            + ", ".join(str(name) for name in invalid)
+        )
 
-    # Match to generator bus names in network.
-    # Generator names follow {bus}_{carrier} convention from nza_base_net.py.
-    active_gens = []
-    for gen_name in network.generators.index:
-        bus = network.generators.at[gen_name, "bus"]
-        # Bus name may be suffixed (e.g. ROX_110) -- extract site code
-        site = bus.split("_")[0] if "_" in bus else bus
-        if site in active_sites:
-            active_gens.append(gen_name)
+    active_mask = build_year.eq(0) | build_year.le(year)
+    active_gens = list(network.generators.index[active_mask])
+    future_gens = list(network.generators.index[~active_mask])
 
-    log.info("    Active generators this month: %d / %d",
+    log.info("    Existing generators active in %d: %d / %d", year,
              len(active_gens), len(network.generators))
+    if future_gens:
+        log.info(
+            "    Not yet commissioned in %d: %s",
+            year,
+            ", ".join(str(name) for name in future_gens),
+        )
     return active_gens
 
 
@@ -222,6 +337,10 @@ def set_dispatchable_availability(
     """
     renewable_carriers = {"wind", "solar_pv", "off_wind"}
 
+    # Base inputs are dormant. Reset explicitly so rerunning this function on
+    # an in-memory network cannot retain an earlier availability value.
+    network.generators.loc[:, "p_max_pu"] = 0.0
+
     for gen in generator_list:
         if gen not in network.generators.index:
             log.warning("    Generator '%s' not found in network -- skipped", gen)
@@ -232,14 +351,26 @@ def set_dispatchable_availability(
         if carrier in renewable_carriers:
             continue   # handled by timeseries assignment
 
-        # Use seasonal hydro profile if available
-        if carrier == "hydro" and hydro_seasonal and month_num in hydro_seasonal:
-            network.generators.at[gen, "p_max_pu"] = float(hydro_seasonal[month_num])
+        if carrier == "hydro" and hydro_seasonal:
+            if month_num not in hydro_seasonal:
+                raise ValueError(
+                    f"hydro_seasonal_availability has no month {month_num}"
+                )
+            value = float(hydro_seasonal[month_num])
         elif carrier in availability:
-            network.generators.at[gen, "p_max_pu"] = availability[carrier]
+            value = float(availability[carrier])
         else:
-            log.warning("    No availability entry for carrier '%s' (gen %s)",
-                        carrier, gen)
+            raise ValueError(
+                f"No availability entry for carrier {carrier!r} "
+                f"(generator {gen})"
+            )
+
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                f"Invalid p_max_pu={value} for generator {gen}; "
+                "expected a value in [0, 1]"
+            )
+        network.generators.at[gen, "p_max_pu"] = value
 
     return network
 
@@ -253,6 +384,7 @@ def assign_renewable_profiles(
     profiles_df: pd.DataFrame,
     carrier: str,
     profile_mapping: Dict[str, str],
+    generator_list: List[str],
 ) -> pypsa.Network:
     """
     Assign p_max_pu timeseries to renewable generators (wind or solar).
@@ -271,30 +403,59 @@ def assign_renewable_profiles(
     -------
     pypsa.Network
     """
-    n_snaps = len(network.snapshots)
-    generators = network.generators[
-        network.generators["carrier"] == carrier
-    ].index
+    generators = [
+        gen for gen in generator_list
+        if network.generators.at[gen, "carrier"] == carrier
+    ]
 
     for gen in generators:
         bus     = network.generators.at[gen, "bus"]
-        site    = bus.split("_")[0] if "_" in bus else bus
-        profile_site = profile_mapping.get(site, site)
+        site    = site_from_bus(bus)
+        profile_site = str(profile_mapping.get(site, site)).strip().upper()
 
         if profile_site not in profiles_df.columns:
-            log.warning("    %s: no profile found (checked '%s') -- skipped",
-                        gen, profile_site)
-            continue
+            raise ValueError(
+                f"{gen}: no {carrier} profile found; checked "
+                f"column {profile_site!r}"
+            )
 
         profile = profiles_df[profile_site].reindex(network.snapshots)
 
-        if profile.isna().all():
-            log.warning("    %s: profile has no overlap with network snapshots",
-                        gen)
-            continue
+        missing = int(profile.isna().sum())
+        if missing:
+            missing_timestamps = profile.index[profile.isna()]
+            valid_solar_gap = (
+                carrier == "solar_pv"
+                and all(
+                    _is_nz_dst_start_gap(value)
+                    for value in missing_timestamps
+                )
+            )
+            if valid_solar_gap:
+                profile.loc[missing_timestamps] = 0.0
+                log.info(
+                    "    %s: inserted zero PV for %d NZ DST spring slots",
+                    gen,
+                    missing,
+                )
+            else:
+                raise ValueError(
+                    f"{gen}: {carrier} profile is missing {missing} of "
+                    f"{len(network.snapshots)} network snapshots"
+                )
 
-        # Fill any residual NaN at edges with 0 (boundary timesteps)
-        profile = profile.fillna(0.0)
+        profile = pd.to_numeric(profile, errors="coerce")
+        if profile.isna().any() or not np.isfinite(profile.to_numpy()).all():
+            raise ValueError(f"{gen}: {carrier} profile contains non-numeric values")
+
+        lower = float(profile.min())
+        upper = float(profile.max())
+        if lower < -1e-9 or upper > 1.0 + 1e-9:
+            raise ValueError(
+                f"{gen}: {carrier} profile range [{lower}, {upper}] "
+                "is outside [0, 1]"
+            )
+        profile = profile.clip(lower=0.0, upper=1.0)
 
         if site != profile_site:
             log.info("    %s at %s: using proxy profile from %s", gen, site, profile_site)
@@ -310,7 +471,7 @@ def assign_renewable_profiles(
 
 
 # =============================================================================
-# BROWNFIELD EXPANSION LIMITS
+# LEGACY EXPANSION HELPERS -- NOT USED BY THE REFERENCE-NETWORK WORKFLOW
 # =============================================================================
 
 def set_brownfield_expansion_limits(
@@ -355,7 +516,7 @@ def set_brownfield_expansion_limits(
 
 
 # =============================================================================
-# GREENFIELD GENERATION
+# GREENFIELD GENERATION (LEGACY HELPER -- NOT INVOKED HERE)
 # =============================================================================
 
 def get_technology_cost(cost_dict: Dict, year: int) -> float:
@@ -509,13 +670,6 @@ def add_greenfield_generators(
 # TECHNOLOGY COSTS
 # =============================================================================
 
-def calculate_annuity(discount_rate: float, lifetime: int) -> float:
-    """Annuity factor for capital cost calculation."""
-    if discount_rate == 0:
-        return 1.0 / lifetime
-    return discount_rate / (1.0 - 1.0 / (1.0 + discount_rate) ** lifetime)
-
-
 def load_cost_data(cost_path: Path) -> Dict:
     """Load technology cost data from YAML file."""
     if not cost_path.exists():
@@ -527,25 +681,21 @@ def load_cost_data(cost_path: Path) -> Dict:
 def apply_generator_costs(
     network: pypsa.Network,
     costs: Dict,
-    year: int,
-    discount_rate: float = 0.07,
 ) -> pypsa.Network:
     """
-    Apply annualised capital and marginal costs to all generators.
+    Apply operating costs to the fixed existing-generator inventory.
 
-    For extendable generators, the full annualised capital cost is applied.
-    For non-extendable generators commissioned more than 10 years ago,
-    capital cost is set to zero (asset considered written down).
+    Existing reference assets are non-extendable, so their capital cost is
+    set to zero without an arbitrary age/write-down rule. Candidate investment
+    capital costs are applied later by TEFF stage preparation. The explicit
+    ``marginal_cost_nzd_per_mwh`` value is copied unchanged from the reviewed
+    cost file.
 
     Parameters
     ----------
     network : pypsa.Network
     costs : dict
         Technology cost data from YAML.
-    year : int
-        Planning year (used for depreciation calculation).
-    discount_rate : float
-
     Returns
     -------
     pypsa.Network
@@ -555,9 +705,10 @@ def apply_generator_costs(
         MODALITY_MAP = {
             "wind": "wind", "solar_pv": "solar_pv", "hydro": "hydro",
             "geothermal": "geothermal", "ocgt": "ocgt", "ccgt": "ccgt",
-            "gas": "ocgt", "coal_gas": "coal_gas", "coal": "coal",
+            "gas": "gas", "coal_gas": "coal_gas", "coal": "coal",
             "diesel": "diesel", "battery": "battery",
             "pumped_hydro": "pumped_hydro", "bioenergy": "bioenergy",
+            "off_wind": "wind_offshore",
         }
         return MODALITY_MAP.get(modality.lower(), modality.lower())
 
@@ -567,33 +718,28 @@ def apply_generator_costs(
         carrier_std = _std(carrier)
 
         if carrier_std not in costs:
-            log.warning("    No cost data for '%s' -- skipping", carrier_std)
-            continue
+            raise ValueError(
+                f"No cost data for generator carrier {carrier!r} "
+                f"(expected technology key {carrier_std!r})"
+            )
 
-        cost_data        = costs[carrier_std]
-        capital_invest   = cost_data.get("capital_cost_nzd_per_mw", 0.0)
-        marginal_cost    = cost_data.get("marginal_cost_nzd_per_mwh", 0.0)
-        lifetime         = cost_data.get("lifetime_years", 25)
-
-        fom_rate = cost_data.get("fixed_om_cost_nzd_per_mw_year", 0.0)
-        fom_abs  = fom_rate * capital_invest if fom_rate < 1 else fom_rate
-
-        annuity            = calculate_annuity(discount_rate, lifetime)
-        annualised_capital = annuity * capital_invest + fom_abs
+        cost_data = costs[carrier_std]
+        if "marginal_cost_nzd_per_mwh" not in cost_data:
+            raise ValueError(
+                f"Cost entry {carrier_std!r} has no "
+                "marginal_cost_nzd_per_mwh"
+            )
+        marginal_cost = float(cost_data["marginal_cost_nzd_per_mwh"])
+        if not np.isfinite(marginal_cost) or marginal_cost < 0.0:
+            raise ValueError(
+                f"Invalid marginal cost for {carrier_std!r}: "
+                f"{marginal_cost}"
+            )
 
         mask = network.generators["carrier"] == carrier
 
         for gen in network.generators[mask].index:
-            is_extendable = network.generators.at[gen, "p_nom_extendable"]
-
-            if is_extendable:
-                gen_capital_cost = annualised_capital
-            else:
-                build_year = network.generators.at[gen, "build_year"]
-                gen_capital_cost = 0.0 if (year - build_year) > 10 else annualised_capital
-
-            # Write costs back to network -- this was the bug in the original
-            network.generators.at[gen, "capital_cost"]  = gen_capital_cost
+            network.generators.at[gen, "capital_cost"] = 0.0
             network.generators.at[gen, "marginal_cost"] = marginal_cost
 
     return network
@@ -603,18 +749,207 @@ def setup_costs(
     network: pypsa.Network,
     paths: Dict,
     config: Dict,
-    year: int,
 ) -> pypsa.Network:
     """Load cost YAML and apply to network."""
     cost_path = paths["costs"] / config["filename"]["costs_file"]
     costs     = load_cost_data(cost_path)
-    network   = apply_generator_costs(network, costs, year)
+    network   = apply_generator_costs(network, costs)
     return network
+
+
+# =============================================================================
+# REFERENCE-NETWORK CONTRACT
+# =============================================================================
+
+def validate_reference_network(network: pypsa.Network) -> None:
+    """Fail if investment candidates or extendable assets are present."""
+    violations = []
+
+    greenfield_generators = [
+        str(name) for name in network.generators.index
+        if str(name).endswith("_greenfield")
+    ]
+    greenfield_storage = [
+        str(name) for name in network.storage_units.index
+        if str(name).endswith("_greenfield")
+    ]
+
+    if greenfield_generators:
+        violations.append(
+            "greenfield generators: " + ", ".join(greenfield_generators)
+        )
+    if greenfield_storage:
+        violations.append(
+            "greenfield storage units: " + ", ".join(greenfield_storage)
+        )
+
+    extendable_components = [
+        ("generators", network.generators, "p_nom_extendable"),
+        ("storage units", network.storage_units, "p_nom_extendable"),
+        ("links", network.links, "p_nom_extendable"),
+        ("lines", network.lines, "s_nom_extendable"),
+        ("transformers", network.transformers, "s_nom_extendable"),
+    ]
+
+    def _as_bool(value) -> bool:
+        if pd.isna(value):
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes"}
+        return bool(value)
+
+    for label, table, attribute in extendable_components:
+        if attribute not in table.columns or table.empty:
+            continue
+        extendable = table.index[table[attribute].map(_as_bool)]
+        if len(extendable):
+            violations.append(
+                f"extendable {label}: "
+                + ", ".join(str(name) for name in extendable)
+            )
+
+    if violations:
+        raise ValueError(
+            "Reference-network contract violated -- " + "; ".join(violations)
+        )
 
 
 # =============================================================================
 # MAIN PROCESSING FUNCTION
 # =============================================================================
+
+def _load_network_for_customisation(network_dir: Path) -> pypsa.Network:
+    """
+    Load one exported base network and restore PyPSA type libraries.
+
+    Parameters
+    ----------
+    network_dir : pathlib.Path
+        Directory containing an exported PyPSA CSV network.
+
+    Returns
+    -------
+    pypsa.Network
+        Imported network with standard line and transformer type libraries
+        restored and dependent electrical values recalculated.
+    """
+    network = pypsa.Network()
+    network.import_from_csv_folder(str(network_dir))
+
+    # Built-in component type libraries are not fully preserved by the CSV
+    # export/import cycle. Restore them from a fresh PyPSA Network instance.
+    reference = pypsa.Network()
+    network.transformer_types = reference.transformer_types
+    network.line_types = reference.line_types
+    register_custom_transformer_types(network)
+
+    network.calculate_dependent_values()
+    network.consistency_check()
+    return network
+
+
+def _customise_network_variant(
+    network: pypsa.Network,
+    year: int,
+    month_num: int,
+    config: Dict,
+    paths: Dict,
+    wind_df: Optional[pd.DataFrame],
+    solar_df: Optional[pd.DataFrame],
+) -> pypsa.Network:
+    """
+    Apply the standard customisation sequence to one network variant.
+
+    The same function is used for South Island, North Island and combined NZ
+    networks so that all three representations receive identical treatment.
+
+    Parameters
+    ----------
+    network : pypsa.Network
+        Imported base network.
+    year : int
+        Simulation year.
+    month_num : int
+        Calendar month number, 1-12.
+    config : dict
+        Loaded network configuration.
+    paths : dict
+        Resolved workspace paths.
+    wind_df : pandas.DataFrame or None
+        Wind p_max_pu profiles for this month.
+    solar_df : pandas.DataFrame or None
+        Solar p_max_pu profiles.
+
+    Returns
+    -------
+    pypsa.Network
+        Customised network, not yet written to disk.
+    """
+    availability = config.get("availability", {})
+    wind_mapping = config.get("WIND_PROFILE_MAPPING", {})
+    solar_mapping = config.get("SOLAR_PROFILE_MAPPING", {})
+    hydro_seasonal = config.get("hydro_seasonal_availability", {})
+    hydro_seasonal = {int(k): float(v) for k, v in hydro_seasonal.items()}
+    expected_months = set(range(1, 13))
+    if set(hydro_seasonal) != expected_months:
+        raise ValueError(
+            "hydro_seasonal_availability must define exactly months 1-12"
+        )
+    invalid_hydro = {
+        month: value
+        for month, value in hydro_seasonal.items()
+        if not 0.0 <= value <= 1.0
+    }
+    if invalid_hydro:
+        raise ValueError(
+            f"Invalid hydro seasonal p_max_pu values: {invalid_hydro}"
+        )
+
+    log.info("\n  Step 1: Identifying active generators")
+    active_gens = get_active_generators(network, year)
+
+    log.info("\n  Step 2: Setting dispatchable availability")
+    network = set_dispatchable_availability(
+        network,
+        active_gens,
+        availability,
+        month_num=month_num,
+        hydro_seasonal=hydro_seasonal,
+    )
+
+    if hydro_seasonal:
+        hydro_pu = hydro_seasonal.get(
+            month_num, availability.get("hydro", 0.75)
+        )
+        log.info(
+            "    Hydro p_max_pu this month (month %d): %.2f",
+            month_num,
+            hydro_pu,
+        )
+
+    log.info("\n  Step 3: Assigning wind profiles")
+    if wind_df is None:
+        raise ValueError("Wind profile dataframe was not loaded")
+    network = assign_renewable_profiles(
+        network, wind_df, "wind", wind_mapping, active_gens
+    )
+
+    log.info("\n  Step 4: Assigning solar profiles")
+    if solar_df is None:
+        raise ValueError("Solar profile dataframe was not loaded")
+    network = assign_renewable_profiles(
+        network, solar_df, "solar_pv", solar_mapping, active_gens
+    )
+
+    log.info("\n  Step 5: Applying generator costs")
+    network = setup_costs(network, paths, config)
+
+    log.info("\n  Step 6: Validating reference-network contract")
+    validate_reference_network(network)
+    network.calculate_dependent_values()
+    network.consistency_check()
+    return network
+
 
 def process_monthly_network(
     month_num: int,
@@ -623,193 +958,117 @@ def process_monthly_network(
     paths: Dict,
 ) -> None:
     """
-    Customise a single monthly network.
+    Customise all three network representations for one month.
+
+    The required representations are:
+
+        - South Island: ``si_<month>_<year>``
+        - North Island: ``ni_<month>_<year>``
+        - Combined NZ: ``<month>_<year>``
+
+    All three input folders must exist. The three networks are loaded and fully
+    customised before any derived output is written. This prevents a
+    customisation error in one representation from silently producing an
+    apparently complete, mixed base/customised monthly dataset.
 
     Parameters
     ----------
     month_num : int
         Month number 1-12.
     year : int
+        Simulation year.
     config : dict
+        Loaded YAML configuration.
     paths : dict
+        Resolved workspace paths.
+
+    Raises
+    ------
+    FileNotFoundError
+        If any required monthly network folder is missing.
+    Exception
+        Any error encountered while loading or customising a network is
+        propagated to ``main`` so the run stops immediately.
     """
-    month_name   = MONTHS[month_num - 1]
-    scenario     = config.get("scenario", "reference")
-
-    # Process all existing network variants for this month:
-    #   si_jan_2024  -- South Island standalone
-    #   ni_jan_2024  -- North Island standalone
-    #   jan_2024     -- Combined two-island network
+    month_name = MONTHS[month_num - 1]
+    scenario = config.get("scenario", "reference")
     base_label = f"{month_name}_{year}"
-    net_base   = paths["networks"] / scenario / str(year)
+    input_base = paths["networks"] / scenario / str(year)
+    output_base = paths["custom_networks"] / scenario / str(year)
 
-    variants = []
-    for label in [f"si_{base_label}", f"ni_{base_label}", base_label]:
-        if (net_base / label).exists():
-            variants.append(label)
+    variants = [
+        (f"si_{base_label}", "South Island"),
+        (f"ni_{base_label}", "North Island"),
+        (base_label, "Combined NZ"),
+    ]
 
-    if not variants:
-        log.error("  No network folder found for %s/%s", year, base_label)
-        return
+    missing = [
+        str(input_base / label)
+        for label, _ in variants
+        if not (input_base / label).is_dir()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Required monthly network folder(s) missing:\n  "
+            + "\n  ".join(missing)
+        )
 
-    # Process first variant -- rest handled in loop at end of function
-    month_label = variants[0]
-    network_dir = net_base / month_label
-
-    log.info("\n%s", "=" * 60)
-    log.info("Customising  %s", month_label)
-    log.info("%s", "=" * 60)
-
-    if not network_dir.exists():
-        log.error("  Network folder not found: %s", network_dir)
-        return
-
-    # Load network
-    network = pypsa.Network()
-    network.import_from_csv_folder(str(network_dir))
-
-    # Restore standard component type libraries lost during CSV export/import.
-    # PyPSA does not write built-in types (transformer_types, line_types) to
-    # CSV -- they must be reloaded from a fresh network instance.
-    _ref = pypsa.Network()
-    network.transformer_types = _ref.transformer_types
-    network.line_types        = _ref.line_types
-    register_custom_transformer_types(network)
-
-    network.consistency_check()
-
-    availability      = config.get("availability", {})
-    wind_mapping      = config.get("WIND_PROFILE_MAPPING", {})
-    solar_mapping     = config.get("SOLAR_PROFILE_MAPPING", {})
-    wind_exp_factors  = config.get("WIND_EXPANSION_FACTORS", {})
-    solar_exp_factors = config.get("SOLAR_EXPANSION_FACTORS", {})
-    weather_year      = config.get("weather_year", year)
-
-    # --- Step 1: Determine active generators ---
-    log.info("\n  Step 1: Identifying active generators")
-    active_gens = get_active_generators(
-        network, paths["annual"], year, month_num
-    )
-
-    # --- Step 2: Set dispatchable availability ---
-    log.info("\n  Step 2: Setting dispatchable availability")
-    hydro_seasonal = config.get("hydro_seasonal_availability", {})
-    # Convert string keys to int (YAML may load them as strings)
-    hydro_seasonal = {int(k): float(v) for k, v in hydro_seasonal.items()}
-    network = set_dispatchable_availability(
-        network, active_gens, availability,
-        month_num=month_num,
-        hydro_seasonal=hydro_seasonal,
-    )
-    if hydro_seasonal:
-        hydro_pu = hydro_seasonal.get(month_num, availability.get("hydro", 0.75))
-        log.info("    Hydro p_max_pu this month (month %d): %.2f", month_num, hydro_pu)
-
-    # --- Step 3: Wind profiles ---
-    log.info("\n  Step 3: Assigning wind profiles")
-    # Wind profiles are stored per simulation year.
-    # File: wind_p_pu_monthly/{year}/wind_p_pu_{YYYYMM}.csv
-    # Timestamps are relabelled to simulation year by generate_wind_profiles.py
+    # Load shared renewable-profile inputs once for this month.
     month_code = f"{year}{month_num:02d}"
-    wind_path  = paths["wind_mon_root"] / str(year) / f"wind_p_pu_{month_code}.csv"
+    wind_path = (
+        paths["wind_mon_root"]
+        / str(year)
+        / f"wind_p_pu_{month_code}.csv"
+    )
+    wind_df = load_profile_csv(wind_path, "Wind")
 
-    if wind_path.exists():
-        wind_df = pd.read_csv(wind_path, index_col=0, parse_dates=True)
-        network = assign_renewable_profiles(network, wind_df, "wind", wind_mapping)
-        network = set_brownfield_expansion_limits(network, "wind", wind_exp_factors)
-    else:
-        log.warning("    Wind profile not found: %s", wind_path)
-        log.warning("    Run generate_wind_profiles.py --years %d first", year)
-
-    # --- Step 4: Solar profiles ---
-    log.info("\n  Step 4: Assigning solar profiles")
-    # For planning years use year-specific file; fall back to base-year alias.
-    solar_year_file  = f"solar_PV_p_pu_{year}.csv"
-    solar_alias_file = config["filename"].get("solar", "solar_PV_p_pu.csv")
+    solar_year_file = f"solar_PV_p_pu_{year}.csv"
+    solar_alias_file = config["filename"].get(
+        "solar", "solar_PV_p_pu.csv"
+    )
     solar_path = paths["solar"] / solar_year_file
     if not solar_path.exists():
         solar_path = paths["solar"] / solar_alias_file
-        log.info("    Year-specific solar file not found -- using alias: %s",
-                 solar_alias_file)
+        log.info(
+            "    Year-specific solar file not found -- using alias: %s",
+            solar_alias_file,
+        )
 
-    if solar_path.exists():
-        solar_df = pd.read_csv(solar_path, index_col=0, parse_dates=True)
-        solar_df.index = pd.to_datetime(solar_df.index)
-        solar_df = solar_df[~solar_df.index.duplicated(keep="first")]
-        network  = assign_renewable_profiles(network, solar_df, "solar_pv", solar_mapping)
-        network  = set_brownfield_expansion_limits(network, "solar_pv", solar_exp_factors)
-    else:
-        log.warning("    Solar profile not found: %s", solar_path)
-        log.warning("    Run generate_solar_profiles.py --years %d first", year)
+    solar_df = load_profile_csv(
+        solar_path,
+        "Solar",
+        normalise_nz_dst=True,
+    )
 
-    # --- Step 5: Greenfield options ---
-    log.info("\n  Step 5: Adding greenfield options")
-    network = add_greenfield_generators(network, config, year)
+    customised = []
 
-    # --- Step 6: Technology costs ---
-    log.info("\n  Step 6: Applying technology costs")
-    network = setup_costs(network, paths, config, year)
+    # Customise all variants in memory first. No network is written until all
+    # three variants for the month have completed successfully.
+    for label, description in variants:
+        input_dir = input_base / label
+        output_dir = output_base / label
 
-    # --- Step 7: Save ---
-    log.info("\n  Step 7: Saving")
-    network.export_to_csv_folder(str(network_dir))
-    log.info("    Saved to %s", network_dir)
+        log.info("\n%s", "=" * 60)
+        log.info("Customising  %s [%s]", label, description)
+        log.info("%s", "=" * 60)
 
-    # --- Process remaining variants (ni_, combined) ---
-    for extra_label in variants[1:]:
-        extra_dir = net_base / extra_label
-        log.info("")
-        log.info("=" * 60)
-        log.info("Customising  %s", extra_label)
-        log.info("=" * 60)
-        try:
-            extra_net = pypsa.Network()
-            extra_net.import_from_csv_folder(str(extra_dir))
-            # Restore standard component type libraries
-            _ref = pypsa.Network()
-            extra_net.transformer_types = _ref.transformer_types
-            extra_net.line_types        = _ref.line_types
-            register_custom_transformer_types(extra_net)
-            extra_net.calculate_dependent_values()
-            # Apply same customisation steps
-            extra_active = get_active_generators(
-                extra_net, paths["annual"], year, month_num)
-            extra_net = set_dispatchable_availability(
-                extra_net, extra_active, availability,
-                month_num=month_num, hydro_seasonal=hydro_seasonal)
-            # Wind profiles
-            month_code = f"{year}{month_num:02d}"
-            wind_path  = paths["wind_mon_root"] / str(year) / f"wind_p_pu_{month_code}.csv"
-            if wind_path.exists():
-                wind_df   = pd.read_csv(str(wind_path), index_col=0, parse_dates=True)
-                wind_df.index = pd.to_datetime(wind_df.index)
-                extra_net = assign_renewable_profiles(
-                    extra_net, wind_df, "wind", wind_mapping)
-                extra_net = set_brownfield_expansion_limits(
-                    extra_net, "wind", wind_exp_factors)
-            # Solar profiles
-            solar_year_file  = f"solar_PV_p_pu_{year}.csv"
-            solar_alias_file = config["filename"].get("solar", "solar_PV_p_pu.csv")
-            solar_path = paths["solar"] / solar_year_file
-            if not solar_path.exists():
-                solar_path = paths["solar"] / solar_alias_file
-            if solar_path.exists():
-                solar_df = pd.read_csv(str(solar_path), index_col=0, parse_dates=True)
-                solar_df.index = pd.to_datetime(solar_df.index)
-                # Remove duplicate timestamps if present
-                solar_df = solar_df[~solar_df.index.duplicated(keep="first")]
-                extra_net = assign_renewable_profiles(
-                    extra_net, solar_df, "solar_pv", solar_mapping)
-                extra_net = set_brownfield_expansion_limits(
-                    extra_net, "solar_pv", solar_exp_factors)
-            extra_net = add_greenfield_generators(extra_net, config, year)
-            extra_net = setup_costs(extra_net, paths, config, year)
-            extra_net.export_to_csv_folder(str(extra_dir))
-            log.info("    Saved to %s", extra_dir)
-        except Exception as exc:
-            log.error("    Failed %s: %s", extra_label, exc)
-            import traceback; traceback.print_exc()
+        network = _load_network_for_customisation(input_dir)
+        network = _customise_network_variant(
+            network=network,
+            year=year,
+            month_num=month_num,
+            config=config,
+            paths=paths,
+            wind_df=wind_df,
+            solar_df=solar_df,
+        )
+        customised.append((label, output_dir, network))
 
+    log.info("\n  Step 7: Saving all three monthly variants")
+    for label, output_dir, network in customised:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        network.export_to_csv_folder(str(output_dir))
+        log.info("    Saved %s to %s", label, output_dir)
 
 # =============================================================================
 # MAIN
@@ -817,34 +1076,69 @@ def process_monthly_network(
 
 def main() -> None:
     """
-    Customise all monthly networks for all configured years.
+    Customise all SI, NI and combined monthly networks for configured years.
+
+    Workspace discovery follows the same mechanism as ``nza_base_net.py``:
+    ``nza_root.py`` is loaded from the shared ``analysis/misc`` directory.
+
+    The run is fail-fast. Any error stops processing immediately rather than
+    continuing and leaving an apparently complete but partially customised
+    network dataset.
     """
     import time
+
     start_time = time.time()
 
-    # Locate workspace via nza_root (reads PYPSA_NZA_ROOT env var).
-    # nza_root.py must sit in the project root directory alongside all
-    # module repos.  See SETUP.md for setup instructions.
-    _root_str = __import__('os').environ.get('PYPSA_NZA_ROOT', '')
-    if _root_str:
-        sys.path.insert(0, str(Path(_root_str).resolve()))
+    # Locate the shared workspace helper relative to this repository.
+    analysis_root = Path(__file__).resolve().parents[1]
+    misc_dir = analysis_root / "misc"
+    nza_root_file = misc_dir / "nza_root.py"
+
+    if not nza_root_file.exists():
+        raise FileNotFoundError(
+            f"Cannot locate nza_root.py: {nza_root_file}"
+        )
+
+    misc_dir_str = str(misc_dir)
+    if misc_dir_str not in sys.path:
+        sys.path.insert(0, misc_dir_str)
+
     from nza_root import WORKSPACE
+
     config_path = WORKSPACE / "config" / "nza_net_config.yaml"
 
-    log.info("Config: %s", config_path)
-    config = load_config(config_path)
-    paths  = resolve_paths(config)
+    log.info("Workspace: %s", WORKSPACE)
+    log.info("Config   : %s", config_path)
 
-    start_year = config["scenario_years"]["start"]
-    end_year   = config["scenario_years"]["end"]
-    years      = list(range(start_year, end_year + 1))
-    scenario   = config.get("scenario", "reference")
+    config = load_config(config_path)
+    validate_renewable_profile_contract(config)
+    paths = resolve_paths(config)
+
+    start_year = int(config["scenario_years"]["start"])
+    end_year = int(config["scenario_years"]["end"])
+    years = list(range(start_year, end_year + 1))
+    scenario = config.get("scenario", "reference")
+
+    input_root = paths["networks"] / scenario
+    output_root = paths["custom_networks"] / scenario
+    if input_root.resolve() == output_root.resolve():
+        raise ValueError(
+            "Customised-network output resolves to the validated base-network "
+            "input directory"
+        )
 
     log.info("\n%s", "#" * 60)
     log.info("# NETWORK CUSTOMISATION")
     log.info("# Scenario : %s", scenario)
-    log.info("# Years    : %d - %d  (%d years)", start_year, end_year, len(years))
-    log.info("# Networks : %d", len(years) * 12)
+    log.info(
+        "# Years    : %d - %d  (%d years)",
+        start_year,
+        end_year,
+        len(years),
+    )
+    log.info("# Networks : %d", len(years) * 12 * 3)
+    log.info("# Input    : %s", input_root)
+    log.info("# Output   : %s", output_root)
     log.info("%s", "#" * 60)
 
     for year in years:
@@ -853,20 +1147,18 @@ def main() -> None:
         log.info("%s", "#" * 60)
 
         for month_num in range(1, 13):
-            try:
-                process_monthly_network(month_num, year, config, paths)
-            except Exception as exc:
-                log.error("Error: %s %d/%02d -- %s",
-                          scenario, year, month_num, exc)
-                import traceback
-                traceback.print_exc()
-                continue
+            process_monthly_network(
+                month_num=month_num,
+                year=year,
+                config=config,
+                paths=paths,
+            )
 
     elapsed = time.time() - start_time
     log.info("\n%s", "=" * 60)
     log.info("Customisation complete  (%.1f min)", elapsed / 60)
+    log.info("Built SI, NI and combined NZ customised networks.")
     log.info("%s", "=" * 60)
-    log.info("Next: run nza_cx_opt.py to optimise capacity expansion")
 
 
 if __name__ == "__main__":
